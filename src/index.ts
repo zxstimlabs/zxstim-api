@@ -1,7 +1,13 @@
 import { Elysia } from "elysia";
+import { rpc } from "./modules/rpc";
+import { pools } from "./modules/pools";
 
-const app = new Elysia().get("/", () => "Hello Elysia").listen(3000);
+const app = new Elysia()
+  .use(rpc)
+  .use(pools)
+  .get("/", () => "Hello Elysia")
+  .listen(8001);
 
 console.log(
-  `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
+  `🦊 Elysia is running at http://${app.server?.hostname}:${app.server?.port}`
 );
