@@ -184,7 +184,7 @@ export abstract class PoolsService {
     let userAddress = log.args.sender as string;
     try {
       const tx = await httpClient.getTransaction({
-        hash: txHash,
+        hash: txHash as Address,
       });
       userAddress = tx.from;
     } catch {
