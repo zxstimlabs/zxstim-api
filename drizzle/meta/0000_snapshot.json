@@ -1,37 +1,325 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "c8db99cd-a6e4-4f4d-bacc-66841a20223e",
+  "id": "da92a64f-0980-45f5-bffb-5057cfe6d9d3",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
-    "movies": {
-      "name": "movies",
+    "indexer_cursor": {
+      "name": "indexer_cursor",
       "columns": {
-        "id": {
-          "name": "id",
-          "type": "integer",
+        "pool_id": {
+          "name": "pool_id",
+          "type": "text",
           "primaryKey": true,
           "notNull": true,
           "autoincrement": false
         },
-        "title": {
-          "name": "title",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "release_year": {
-          "name": "release_year",
+        "last_indexed_block": {
+          "name": "last_indexed_block",
           "type": "integer",
           "primaryKey": false,
-          "notNull": false,
+          "notNull": true,
           "autoincrement": false
         }
       },
       "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "pool_meta": {
+      "name": "pool_meta",
+      "columns": {
+        "pool_id": {
+          "name": "pool_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "currency0_symbol": {
+          "name": "currency0_symbol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "currency1_symbol": {
+          "name": "currency1_symbol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "currency0_decimals": {
+          "name": "currency0_decimals",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "currency1_decimals": {
+          "name": "currency1_decimals",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "pool_states": {
+      "name": "pool_states",
+      "columns": {
+        "pool_id": {
+          "name": "pool_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "block_number": {
+          "name": "block_number",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "block_timestamp": {
+          "name": "block_timestamp",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sqrt_price_x96": {
+          "name": "sqrt_price_x96",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "tick": {
+          "name": "tick",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "protocol_fee": {
+          "name": "protocol_fee",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "lp_fee": {
+          "name": "lp_fee",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "liquidity": {
+          "name": "liquidity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "fee_growth_global_0": {
+          "name": "fee_growth_global_0",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "fee_growth_global_1": {
+          "name": "fee_growth_global_1",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "reserve0": {
+          "name": "reserve0",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "reserve1": {
+          "name": "reserve1",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "pool_states_pool_id_block_number_pk": {
+          "columns": [
+            "pool_id",
+            "block_number"
+          ],
+          "name": "pool_states_pool_id_block_number_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "swaps": {
+      "name": "swaps",
+      "columns": {
+        "tx_hash": {
+          "name": "tx_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "log_index": {
+          "name": "log_index",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "pool_id": {
+          "name": "pool_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "block_number": {
+          "name": "block_number",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "block_timestamp": {
+          "name": "block_timestamp",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sender": {
+          "name": "sender",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "user_address": {
+          "name": "user_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "amount0": {
+          "name": "amount0",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "amount1": {
+          "name": "amount1",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sqrt_price_x96": {
+          "name": "sqrt_price_x96",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "liquidity": {
+          "name": "liquidity",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "tick": {
+          "name": "tick",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "fee": {
+          "name": "fee",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "price": {
+          "name": "price",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "swaps_pool_ts_idx": {
+          "name": "swaps_pool_ts_idx",
+          "columns": [
+            "pool_id",
+            "block_timestamp"
+          ],
+          "isUnique": false
+        },
+        "swaps_pool_block_idx": {
+          "name": "swaps_pool_block_idx",
+          "columns": [
+            "pool_id",
+            "block_number"
+          ],
+          "isUnique": false
+        },
+        "swaps_pool_user_idx": {
+          "name": "swaps_pool_user_idx",
+          "columns": [
+            "pool_id",
+            "user_address"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "swaps_tx_hash_log_index_pk": {
+          "columns": [
+            "tx_hash",
+            "log_index"
+          ],
+          "name": "swaps_tx_hash_log_index_pk"
+        }
+      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     }

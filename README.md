@@ -16,11 +16,119 @@ Server runs at http://localhost:8001
 Create a `.env.local` file:
 
 ```
+DATABASE_PATH=./sqlite.db
 ARBITRUM_SEPOLIA_RPC_URL=https://arb-sepolia.g.alchemy.com/v2/<YOUR_KEY>
 ARBITRUM_SEPOLIA_WSS_URL=wss://arb-sepolia.g.alchemy.com/v2/<YOUR_KEY>
 HOT_MANAGER_WALLET_PRIVATE_KEY=0x<YOUR_PRIVATE_KEY>
 HOT_MANAGER_WALLET_ADDRESS=0x<YOUR_ADDRESS>
 ```
+
+On the production server use the same keys but in a file named `.env.production`. The deploy script and systemd unit both reference that filename — see the Deployment section below.
+
+## Deployment
+
+A `deploy.sh` script lives at the repo root and handles each redeploy: `git pull`, `bun install`, generate + apply migrations, compile a single binary into `./build/zxstim-api`, restart the systemd service. Everything lives inside the repo directory — code, binary, and database — and that whole directory is the unit of backup.
+
+### Layout on the server
+
+```
+/home/ubuntu/zxstim-api/
+├── src/                      # source (from git)
+├── drizzle/                  # migrations (from git)
+├── build/zxstim-api          # compiled binary (gitignored, rebuilt by deploy.sh)
+├── sqlite.db                 # database (gitignored, persists across deploys)
+├── sqlite.db-wal             # SQLite WAL (gitignored)
+├── sqlite.db-shm             # SQLite SHM (gitignored)
+├── .env.production           # secrets (gitignored, hand-maintained)
+└── deploy.sh                 # this script
+```
+
+`.env.production`, `build/`, and `sqlite.db*` are all in `.gitignore`, so `git pull` never touches them.
+
+### One-time server setup (run on the server, not locally)
+
+1. **Install Bun, Git, and ensure sudo is available** for the deploy user (default assumption: `ubuntu`).
+
+2. **Clone the repo** to the expected path (the deploy script hard-codes this):
+
+    ```bash
+    git clone <repo-url> /home/ubuntu/zxstim-api
+    cd /home/ubuntu/zxstim-api
+    ```
+
+3. **Create `.env.production`** in the repo root (gitignored — never commit it). Mirror `.env.local` but with production values. The simplest `DATABASE_PATH` is `./sqlite.db` — since the systemd unit sets `WorkingDirectory=/home/ubuntu/zxstim-api`, that resolves to `/home/ubuntu/zxstim-api/sqlite.db`.
+
+4. **Make `deploy.sh` executable** (only needed once — git doesn't track the executable bit reliably across platforms):
+
+    ```bash
+    chmod +x /home/ubuntu/zxstim-api/deploy.sh
+    ```
+
+5. **Create the systemd unit** at `/etc/systemd/system/zxstim-api.service`:
+
+    ```ini
+    [Unit]
+    Description=zxstim-api
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=ubuntu
+    WorkingDirectory=/home/ubuntu/zxstim-api
+    EnvironmentFile=/home/ubuntu/zxstim-api/.env.production
+    ExecStart=/home/ubuntu/zxstim-api/build/zxstim-api
+    Restart=on-failure
+    RestartSec=5s
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+
+    Then enable it:
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable zxstim-api.service
+    ```
+
+6. **Grant passwordless sudo** for the systemctl calls in `deploy.sh` (otherwise the script will pause for a password):
+
+    ```
+    # /etc/sudoers.d/zxstim-api
+    ubuntu ALL=(ALL) NOPASSWD: /bin/systemctl restart zxstim-api.service, /bin/systemctl status zxstim-api.service
+    ```
+
+7. **First deploy** — run `./deploy.sh` once. The migration step will create `sqlite.db`, the build step will produce `build/zxstim-api`, and the service will start.
+
+### Each redeploy
+
+```bash
+ssh <server>
+cd /home/ubuntu/zxstim-api
+./deploy.sh
+```
+
+### Things that should be done locally (not on the server)
+
+- **`bun db:generate`.** Schema migrations should be generated locally where there's a TTY for rename/delete disambiguation, then committed alongside the schema change. The deploy script runs `db:generate` as a safety net, but if it ever needs to disambiguate it will fail on the server (no TTY). Treat any "generate produced changes on server" as a sign you forgot to commit a migration.
+
+### Backing up the database
+
+The DB lives at `/home/ubuntu/zxstim-api/sqlite.db`. Take a hot backup with:
+
+```bash
+sqlite3 /home/ubuntu/zxstim-api/sqlite.db ".backup /path/to/backup.db"
+```
+
+(`cp` works too, but the `.backup` command handles in-flight writes correctly with WAL mode enabled.)
+
+**Don't `rm -rf` the repo or `git clean -fdx` it** — both will delete `sqlite.db`. Use `git pull` (which respects `.gitignore`) and let `deploy.sh` do the rest.
+
+### Troubleshooting
+
+- **Service won't start** → `journalctl -u zxstim-api.service -e` for the latest output. Most common causes: missing `.env.production`, `sqlite.db` not writable, or binary path mismatch in the unit file.
+- **`deploy.sh` exits at migration** → check the generated SQL in `drizzle/` matches the schema in git; the wrong commit may be checked out.
+- **WSS / RPC errors after deploy** → confirm `ARBITRUM_SEPOLIA_WSS_URL` and `ARBITRUM_SEPOLIA_RPC_URL` in `.env.production`. The indexer fails fast if either is unset.
 
 ## Pools WebSocket Integration
 
@@ -28,8 +136,13 @@ The `/pools` module streams live Uniswap V4 pool state and swap events to fronte
 
 ### Endpoints
 
-- **REST** `GET /pools/:poolId` — returns latest pool state + recent swaps
+- **REST** `GET /pools/:poolId` — returns latest pool state + recent 50 swaps (read from SQLite)
+- **REST** `GET /pools/:poolId/candles?resolution=…&from=…&to=…&limit=…` — OHLCV candles aggregated from indexed swaps
 - **WebSocket** `WS /pools/:poolId/ws` — streams pool state updates and swap events in real time
+
+### Data source
+
+All `/pools` endpoints (REST and WS-on-connect) read from a local SQLite indexer. On boot the server backfills every `Swap` event from the pool deploy block to the chain head, then keeps the DB live via a WSS subscription plus a 30 s HTTP catch-up poller. Restarting the server doesn't lose history.
 
 ### Pool ID
 
@@ -81,9 +194,11 @@ All messages are JSON with a `type` field:
     "liquidity": "74228532250072169377684025",
     "tick": 178255,
     "fee": 500,
+    "price": 55107539.16,
     "transactionHash": "0x...",
     "blockNumber": "271312626",
-    "timestamp": 1779814558367
+    "blockTimestamp": 1779814558,
+    "timestamp": 1779814558000
   }
 }
 ```
@@ -91,6 +206,8 @@ All messages are JSON with a `type` field:
 - `sender` is the contract that called the PoolManager (usually the Universal Router)
 - `userAddress` is the wallet that initiated the transaction (`tx.from`)
 - `amount0`/`amount1` are signed — negative means tokens going in, positive means tokens coming out
+- `price` is the post-trade price (currency1 per currency0), pre-computed from `sqrtPriceX96` and the token decimals — use directly for charts
+- `blockTimestamp` is the on-chain block time in **unix seconds**; `timestamp` is the same value in **unix milliseconds** (both are block-derived, not server-derived)
 
 #### `recent_swaps` — sent once on connect
 
@@ -101,7 +218,7 @@ All messages are JSON with a `type` field:
 }
 ```
 
-Contains the last 50 swap events cached in memory. Same shape as `swap` data.
+Contains the last 50 swap events from the indexer DB (chronological, oldest first). Same shape as `swap` data.
 
 ### Filtering Swaps by Address
 
@@ -225,6 +342,168 @@ function MySwapFeed({ address }: { address: string }) {
 ```
 
 All bigint values are serialized as strings. Parse them with `BigInt(value)` on the frontend.
+
+### Candlestick Chart Integration
+
+Use `GET /pools/:poolId/candles` to seed a chart with arbitrary history, then keep it live by appending the latest swap from the WebSocket stream into the trailing candle.
+
+#### Endpoint
+
+`GET /pools/:poolId/candles?resolution=<r>&from=<sec>&to=<sec>&limit=<n>`
+
+| Param | Required | Description |
+|---|---|---|
+| `resolution` | yes | One of `1m`, `5m`, `15m`, `1h`, `4h`, `1d` |
+| `from` | no | Lower bound (unix **seconds**, inclusive). Default: `to - bucketSeconds * limit` |
+| `to` | no | Upper bound (unix **seconds**, exclusive). Default: now + one bucket (so the current in-progress candle is included) |
+| `limit` | no | Max candles to return, oldest-first. Default 500, max 1000 |
+
+#### Response
+
+```json
+{
+  "resolution": "1m",
+  "bucketSeconds": 60,
+  "from": 1779814000,
+  "to": 1779817600,
+  "candles": [
+    {
+      "t": 1779814200,
+      "open": 55098750.20,
+      "high": 55100749.62,
+      "low": 55098750.20,
+      "close": 55099103.43,
+      "volume0": 4.5e18,
+      "volume1": 2.48e26,
+      "n": 8
+    }
+  ]
+}
+```
+
+- `t` is the bucket-start time in **unix seconds**
+- `open`/`high`/`low`/`close` are floats in currency1-per-currency0 (e.g. VND per ETH)
+- `volume0`/`volume1` are sums of `|amount0|` / `|amount1|` for the bucket, in raw token base units (float64 — exact up to ~9 × 10¹⁵, fine for charting)
+- `n` is the swap count in the bucket
+- `candles` is ordered oldest → newest
+
+Candles are aggregated on-demand from the `swaps` table — any resolution and any historical depth work without precomputed tables.
+
+#### Recommended frontend flow
+
+1. **Seed:** call `/candles` to populate the chart with history.
+2. **Tail:** open the WS, ignore `recent_swaps` (you already have it), and listen for `swap` events.
+3. **On each `swap`:** compute its bucket as `bucketStart = Math.floor(swap.blockTimestamp / bucketSeconds) * bucketSeconds`. If it matches the last candle's `t`, update OHLC and add to volume. Otherwise push a new candle.
+
+```tsx
+import { useEffect, useRef, useState } from "react";
+
+type Resolution = "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+
+interface Candle {
+  t: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume0: number;
+  volume1: number;
+  n: number;
+}
+
+interface SwapEvent {
+  blockTimestamp: number;
+  price: number;
+  amount0: string;
+  amount1: string;
+}
+
+const BUCKET_SECONDS: Record<Resolution, number> = {
+  "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400,
+};
+
+function applySwapToCandles(
+  candles: Candle[],
+  swap: SwapEvent,
+  bucketSeconds: number
+): Candle[] {
+  const t = Math.floor(swap.blockTimestamp / bucketSeconds) * bucketSeconds;
+  const vol0 = Math.abs(Number(BigInt(swap.amount0)));
+  const vol1 = Math.abs(Number(BigInt(swap.amount1)));
+  const last = candles[candles.length - 1];
+
+  if (last && last.t === t) {
+    const updated: Candle = {
+      ...last,
+      high: Math.max(last.high, swap.price),
+      low: Math.min(last.low, swap.price),
+      close: swap.price,
+      volume0: last.volume0 + vol0,
+      volume1: last.volume1 + vol1,
+      n: last.n + 1,
+    };
+    return [...candles.slice(0, -1), updated];
+  }
+
+  const fresh: Candle = {
+    t,
+    open: swap.price,
+    high: swap.price,
+    low: swap.price,
+    close: swap.price,
+    volume0: vol0,
+    volume1: vol1,
+    n: 1,
+  };
+  return [...candles, fresh];
+}
+
+export function useCandles(
+  poolId: string,
+  resolution: Resolution,
+  apiUrl: string,
+  limit = 500
+) {
+  const bucketSeconds = BUCKET_SECONDS[resolution];
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      const res = await fetch(
+        `${apiUrl}/pools/${poolId}/candles?resolution=${resolution}&limit=${limit}`
+      );
+      const json = await res.json();
+      if (cancelled) return;
+      setCandles(json.candles);
+
+      const ws = new WebSocket(
+        `${apiUrl.replace(/^http/, "ws")}/pools/${poolId}/ws`
+      );
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type !== "swap") return;
+        setCandles((prev) =>
+          applySwapToCandles(prev, msg.data as SwapEvent, bucketSeconds)
+        );
+      };
+    })();
+
+    return () => {
+      cancelled = true;
+      wsRef.current?.close();
+    };
+  }, [poolId, resolution, apiUrl, limit, bucketSeconds]);
+
+  return candles;
+}
+```
+
+Hand `candles` to any OHLC charting library (lightweight-charts, react-financial-charts, recharts, etc.).
 
 ## Delegate (EIP-7702 Gas Sponsorship)
 
@@ -716,3 +995,682 @@ console.log(result.transactionHash);
 1. **One-time setup**: User delegates EOA to `BatchCallAndSponsor` via `POST /delegate/arbitrum-sepolia`
 2. **Each trade**: User builds the calls array, reads the nonce from their delegated EOA, signs `keccak256(abi.encodePacked(nonce, ...calls))` with personal sign, then POSTs to `POST /sponsor/trade`
 3. **Server**: Hot wallet calls `execute(calls, signature)` on the user's EOA, paying the gas. The contract verifies the signature matches the EOA owner and increments the nonce for replay protection.
+
+## Claim Mock Tokens
+
+The `/claim/mock-tokens` endpoint lets a user claim a faucet drop of mock ERC-20 tokens (mETH and/or mVND) to their own address. The user signs a canonical claim message with their EOA; the server verifies the signature, then the hot manager wallet transfers a fixed amount of each requested token to the signer.
+
+Tokens are always sent to the signer of the message — there is no custom receiver field.
+
+### Endpoint
+
+**POST** `/claim/mock-tokens`
+
+### Request Body
+
+```json
+{
+  "requester": "0x<user EOA address>",
+  "tokens": [
+    "0x3890f8Fb0F7aa237e03E995CFe7282fdb519F95a",
+    "0x46DEA9Be3165024CC358Fa24798458e62BFC1d57"
+  ],
+  "nonce": 1779814558367,
+  "signature": "0x<EIP-191 signature>"
+}
+```
+
+| Field | Description |
+|---|---|
+| `requester` | The user's EOA address. Tokens are sent here. Must match the signer recovered from `signature`. |
+| `tokens` | Array of ERC-20 token addresses to claim. Each must be in the server's allowlist (mETH, mVND). |
+| `nonce` | Unix timestamp in **milliseconds**. Server rejects if it drifts more than 5 minutes from server time. |
+| `signature` | EIP-191 (`personal_sign`) signature over the canonical message (see below). |
+
+### Response
+
+**Success (200):**
+
+```json
+{
+  "transfers": [
+    {
+      "token": "0x3890f8Fb0F7aa237e03E995CFe7282fdb519F95a",
+      "amount": "0.1",
+      "transactionHash": "0x..."
+    },
+    {
+      "token": "0x46DEA9Be3165024CC358Fa24798458e62BFC1d57",
+      "amount": "5000000",
+      "transactionHash": "0x..."
+    }
+  ]
+}
+```
+
+`amount` is in human units; the server applies the token's decimals when calling `transfer`. Transfers run sequentially; if one reverts, the prior ones are already on-chain.
+
+**Error (400):**
+
+```json
+{ "error": "invalid signature" }
+```
+
+Other error messages include: `nonce expired or invalid`, `token <address> is not claimable`, `tokens array is empty`, `claim transfer for <address> reverted`.
+
+### Claimable Tokens
+
+| Symbol | Address | Amount per claim |
+|---|---|---|
+| mETH | `0x3890f8Fb0F7aa237e03E995CFe7282fdb519F95a` | 0.1 |
+| mVND | `0x46DEA9Be3165024CC358Fa24798458e62BFC1d57` | 5,000,000 |
+
+Amounts are defined in `src/config/claim.ts` and can be tuned without touching the route logic.
+
+### Signing the Claim
+
+The client must sign exactly this message via `personal_sign`. Addresses are **EIP-55 checksummed** and tokens are joined by a comma with no spaces:
+
+```
+zxstim-api claim mock-tokens
+requester: 0xAbC...123
+tokens: 0x3890f8Fb0F7aa237e03E995CFe7282fdb519F95a,0x46DEA9Be3165024CC358Fa24798458e62BFC1d57
+nonce: 1779814558367
+```
+
+The server reconstructs this exact string from the request body (re-checksumming `requester` and each token), verifies the signature with viem's `verifyMessage`, and rejects if the recovered signer ≠ `requester`.
+
+### Frontend Integration (viem)
+
+```ts
+import { getAddress, type Address } from "viem";
+import { walletClient } from "./config"; // user's wallet client
+
+const MOCK_ETH = "0x3890f8Fb0F7aa237e03E995CFe7282fdb519F95a" as Address;
+const MOCK_VND = "0x46DEA9Be3165024CC358Fa24798458e62BFC1d57" as Address;
+
+async function claimMockTokens(tokens: Address[], apiUrl: string) {
+  const account = walletClient.account!;
+  const requester = getAddress(account.address);
+  const normalizedTokens = tokens.map(getAddress);
+  const nonce = Date.now();
+
+  // 1. Build the canonical message (must match server format exactly)
+  const message = [
+    "zxstim-api claim mock-tokens",
+    `requester: ${requester}`,
+    `tokens: ${normalizedTokens.join(",")}`,
+    `nonce: ${nonce}`,
+  ].join("\n");
+
+  // 2. Sign with personal_sign (gasless — no tx sent)
+  const signature = await walletClient.signMessage({
+    account,
+    message,
+  });
+
+  // 3. POST to the claim API
+  const response = await fetch(`${apiUrl}/claim/mock-tokens`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      requester,
+      tokens: normalizedTokens,
+      nonce,
+      signature,
+    }),
+  });
+
+  return response.json();
+}
+```
+
+Usage:
+
+```ts
+// Claim both mock tokens in one request
+const result = await claimMockTokens(
+  [MOCK_ETH, MOCK_VND],
+  "http://localhost:8001"
+);
+console.log(result.transfers);
+
+// Or claim just one
+const ethOnly = await claimMockTokens([MOCK_ETH], "http://localhost:8001");
+```
+
+### React Hook Example
+
+```tsx
+import { useState } from "react";
+import { getAddress, type Address } from "viem";
+import { useWalletClient } from "wagmi";
+
+interface ClaimTransfer {
+  token: Address;
+  amount: string;
+  transactionHash: string;
+}
+
+function useClaimMockTokens(apiUrl: string) {
+  const { data: walletClient } = useWalletClient();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [transfers, setTransfers] = useState<ClaimTransfer[]>([]);
+
+  const claim = async (tokens: Address[]) => {
+    if (!walletClient) throw new Error("wallet not connected");
+    setLoading(true);
+    setError(null);
+
+    try {
+      const requester = getAddress(walletClient.account.address);
+      const normalizedTokens = tokens.map(getAddress);
+      const nonce = Date.now();
+
+      const message = [
+        "zxstim-api claim mock-tokens",
+        `requester: ${requester}`,
+        `tokens: ${normalizedTokens.join(",")}`,
+        `nonce: ${nonce}`,
+      ].join("\n");
+
+      const signature = await walletClient.signMessage({ message });
+
+      const res = await fetch(`${apiUrl}/claim/mock-tokens`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requester,
+          tokens: normalizedTokens,
+          nonce,
+          signature,
+        }),
+      });
+
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "claim failed");
+
+      setTransfers(json.transfers);
+      return json.transfers as ClaimTransfer[];
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "claim failed");
+      throw e;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return { claim, loading, error, transfers };
+}
+```
+
+### Flow Summary
+
+1. **Client**: Builds the canonical claim message including `requester`, comma-joined checksum `tokens`, and a millisecond `nonce`, then signs it with `personal_sign` (no gas, no tx).
+2. **Client → API**: POSTs `{ requester, tokens, nonce, signature }` to `/claim/mock-tokens`.
+3. **Server**: Re-checksums the inputs, rebuilds the identical message, recovers the signer with `verifyMessage`, and rejects if it doesn't match `requester` or if the nonce is outside the ±5 min window or any token is not in the allowlist.
+4. **Server**: Hot manager wallet calls `transfer(requester, amount)` on each requested ERC-20, waits for the receipt, and returns the list of transfers with their transaction hashes.
+
+### Notes & Caveats
+
+- **Replay window**: The 5-minute nonce check is best-effort. Within that window the same `(requester, tokens, nonce, signature)` tuple could be replayed — if you need strict one-shot semantics, store consumed nonces server-side.
+- **No partial rollback**: If the second `transfer` reverts, the first one has already been mined. The error message identifies which token failed.
+- **Decimals**: Both mock tokens use 18 decimals; the server's `parseUnits` call assumes that. Update `src/config/claim.ts` if a token with different decimals is added.
+
+## Pools Integration Guide (Frontend)
+
+Self-contained guide for integrating the `/pools` module — covers REST history, OHLCV candles, and the live WebSocket. Anything below is what the frontend needs; ignore the earlier "Pools WebSocket Integration" section, which is superseded by this one.
+
+### Architecture in one paragraph
+
+The server runs an in-process indexer that backfills every historical `Swap` event for the supported pool into a local SQLite database on boot, then keeps the DB live via a WebSocket subscription to the chain plus a 30-second HTTP catch-up poller (so dropped WS events get repaired automatically). All REST and WS endpoints in this section read from that DB. The frontend never talks to the chain directly.
+
+### Base URLs
+
+| | Local dev | Production |
+|---|---|---|
+| REST | `http://localhost:8001` | provided by ops |
+| WS | `ws://localhost:8001` | swap `http://` → `ws://` (or `https://` → `wss://`) |
+
+CORS is enabled with `origin: true` so any frontend origin works.
+
+### Supported pool ID
+
+```
+0x363251ac1864e05ea6f839785a02ccaef52cd97f9e2b4516a4c47b638efb4257
+```
+
+The API is parameterised by `:poolId`, but only this one is currently indexed. Any other ID returns `404 { "error": "Pool not found" }`.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/pools/:poolId` | Latest pool state + last 50 swaps |
+| GET | `/pools/:poolId/candles` | OHLCV candles (any resolution, any depth) |
+| WS  | `/pools/:poolId/ws`     | Live `pool_state` + `swap` stream |
+
+### 1. `GET /pools/:poolId`
+
+Returns the latest pool snapshot and the most recent 50 swaps, both from SQLite.
+
+**Response 200**
+
+```json
+{
+  "pool": {
+    "currency0Symbol": "ETH",
+    "currency1Symbol": "VND",
+    "currency0Decimals": 18,
+    "currency1Decimals": 18,
+    "sqrtPriceX96": "588100859679867612338768403599633",
+    "tick": 178255,
+    "protocolFee": 0,
+    "lpFee": 500,
+    "liquidity": "74228532250072169377684025",
+    "feeGrowthGlobal0X128": "346111096686892598082152625",
+    "feeGrowthGlobal1X128": "23019849040645226698443971215162792",
+    "reserve0": "9999968821516356479511",
+    "reserve1": "550989227082318594375578085831",
+    "blockNumber": "271312626",
+    "updatedAt": 1779814558367
+  },
+  "recentSwaps": [ /* SwapEvent[], oldest-first */ ]
+}
+```
+
+**Other statuses**
+
+- `404 { error: "Pool not found" }` — wrong pool ID
+- `503 { error: "Pool state not yet available" }` — server just booted and the indexer hasn't written a state snapshot yet. Retry after a few seconds.
+
+All large integers are JSON strings. Parse with `BigInt(value)` on the frontend.
+
+### 2. `GET /pools/:poolId/candles`
+
+OHLCV candles aggregated on-demand from the indexed swaps. Any resolution and any historical depth work — there are no precomputed tables to fall behind.
+
+**Query parameters**
+
+| Name | Required | Description |
+|---|---|---|
+| `resolution` | yes | `1m` \| `5m` \| `15m` \| `1h` \| `4h` \| `1d` |
+| `from` | no | Lower bound, **unix seconds**, inclusive. Default: `to − bucketSeconds × limit` |
+| `to` | no | Upper bound, **unix seconds**, exclusive. Default: `now + bucketSeconds` (so the current in-progress candle is included) |
+| `limit` | no | Max candles, oldest-first. Default 500, max 1000 |
+
+**Response 200**
+
+```json
+{
+  "resolution": "1m",
+  "bucketSeconds": 60,
+  "from": 1779814000,
+  "to": 1779817600,
+  "candles": [
+    {
+      "t": 1779814200,
+      "open": 55098750.20,
+      "high": 55100749.62,
+      "low": 55098750.20,
+      "close": 55099103.43,
+      "volume0": 4500000000000000000,
+      "volume1": 248000000000000000000000,
+      "n": 8
+    }
+  ]
+}
+```
+
+| Field | Notes |
+|---|---|
+| `t` | Bucket-start time, **unix seconds**. The bucket covers `[t, t + bucketSeconds)` |
+| `open` / `high` / `low` / `close` | Floats, in currency1 per currency0 (e.g. VND per ETH) |
+| `volume0` / `volume1` | Sum of `\|amount0\|` / `\|amount1\|` in the bucket, raw token base units. Float64 (exact up to ~9×10¹⁵ — fine for charting; for accounting-grade precision use raw swap events) |
+| `n` | Swap count in the bucket |
+| `candles` | Ordered oldest → newest |
+
+Buckets with no swaps are **omitted** from the array (sparse). If the chart needs continuous time, fill gaps client-side by carrying `close` forward as `open=high=low=close` and `volume=0`.
+
+**Error**
+
+- `400 { error: "`from` must be less than `to`" }`
+
+### 3. `WS /pools/:poolId/ws`
+
+Bidirectional connection. The server sends typed JSON messages; the client can send a filter command.
+
+#### Server → client messages
+
+Every message is JSON with a `type` field.
+
+**`pool_state`** — sent once on connect, then again whenever any tracked field changes on a new block. Same shape as `pool.{…}` from `GET /pools/:poolId`.
+
+```json
+{ "type": "pool_state", "data": { /* PoolState */ } }
+```
+
+**`recent_swaps`** — sent once on connect. Last 50 swaps from SQLite, oldest-first.
+
+```json
+{ "type": "recent_swaps", "data": [ /* SwapEvent[] */ ] }
+```
+
+**`swap`** — sent for each new swap as it's indexed.
+
+```json
+{
+  "type": "swap",
+  "data": {
+    "poolId": "0x363251ac...",
+    "sender": "0xeFd1D4...",
+    "userAddress": "0xb4A520...",
+    "amount0": "-1000000000000000000",
+    "amount1": "55000000000000000000000",
+    "sqrtPriceX96": "588100859679867612338768403599633",
+    "liquidity": "74228532250072169377684025",
+    "tick": 178255,
+    "fee": 500,
+    "price": 55107539.16,
+    "transactionHash": "0x...",
+    "blockNumber": "271312626",
+    "blockTimestamp": 1779814558,
+    "timestamp": 1779814558000
+  }
+}
+```
+
+| Field | Notes |
+|---|---|
+| `sender` | Contract that called the PoolManager (usually the Universal Router) |
+| `userAddress` | Wallet that initiated the tx (`tx.from`). **Use this for per-user filtering.** |
+| `amount0` / `amount1` | Signed strings. Negative = into pool, positive = out of pool |
+| `price` | Post-trade price, currency1 per currency0. Pre-computed for charts |
+| `blockTimestamp` | On-chain block time, **unix seconds** |
+| `timestamp` | Same value, **unix milliseconds** (convenience) |
+
+#### Client → server messages
+
+**Filter swaps by user address** — only the filtered client's swap stream is narrowed; `pool_state` is unaffected.
+
+```json
+{ "filterAddress": "0xb4A520D855C21A449d1031727911BDE602FfA7DC" }
+```
+
+Clear the filter:
+
+```json
+{ "filterAddress": null }
+```
+
+The filter compares case-insensitively against `swap.data.userAddress`.
+
+### Recommended frontend flows
+
+#### Flow A — live swap feed (e.g. "recent trades" panel)
+
+1. Open the WS.
+2. Render `recent_swaps` on the initial frame.
+3. Prepend each `swap` event to the list as it arrives.
+
+#### Flow B — candlestick chart with live update
+
+1. `GET /pools/:poolId/candles?resolution=1m&limit=500` → seed the chart.
+2. Open the WS, ignore `recent_swaps` (you already have history), and listen for `swap`.
+3. For each `swap`, compute its bucket from `blockTimestamp` and either update the last candle or push a new one. Same code, every resolution.
+
+#### Flow C — pool stats dashboard ("current price", "liquidity", "24h volume")
+
+1. `GET /pools/:poolId` for the snapshot.
+2. Open the WS and replace local pool state on each `pool_state` message.
+3. For 24h volume, prefer `/candles?resolution=1h&limit=24` summed client-side, or `?resolution=1d&limit=1`.
+
+### Drop-in React examples
+
+#### Live swap feed
+
+```tsx
+import { useEffect, useRef, useState } from "react";
+
+interface SwapEvent {
+  transactionHash: string;
+  userAddress: string;
+  amount0: string;
+  amount1: string;
+  price: number;
+  blockTimestamp: number;
+}
+
+const POOL_ID =
+  "0x363251ac1864e05ea6f839785a02ccaef52cd97f9e2b4516a4c47b638efb4257";
+
+export function useSwapFeed(apiUrl: string, filterAddress?: string) {
+  const [swaps, setSwaps] = useState<SwapEvent[]>([]);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    const wsUrl = apiUrl.replace(/^http/, "ws");
+    const ws = new WebSocket(`${wsUrl}/pools/${POOL_ID}/ws`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      if (filterAddress) {
+        ws.send(JSON.stringify({ filterAddress }));
+      }
+    };
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "recent_swaps") {
+        setSwaps(msg.data.slice().reverse()); // newest-first for the panel
+      } else if (msg.type === "swap") {
+        setSwaps((prev) => [msg.data, ...prev].slice(0, 100));
+      }
+    };
+
+    return () => ws.close();
+  }, [apiUrl, filterAddress]);
+
+  return swaps;
+}
+```
+
+#### Candlestick chart with live update
+
+```tsx
+import { useEffect, useRef, useState } from "react";
+
+type Resolution = "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+
+interface Candle {
+  t: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume0: number;
+  volume1: number;
+  n: number;
+}
+
+interface SwapEvent {
+  blockTimestamp: number;
+  price: number;
+  amount0: string;
+  amount1: string;
+}
+
+const BUCKET_SECONDS: Record<Resolution, number> = {
+  "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400,
+};
+
+const POOL_ID =
+  "0x363251ac1864e05ea6f839785a02ccaef52cd97f9e2b4516a4c47b638efb4257";
+
+function applySwap(
+  candles: Candle[],
+  swap: SwapEvent,
+  bucketSeconds: number
+): Candle[] {
+  const t =
+    Math.floor(swap.blockTimestamp / bucketSeconds) * bucketSeconds;
+  const vol0 = Math.abs(Number(BigInt(swap.amount0)));
+  const vol1 = Math.abs(Number(BigInt(swap.amount1)));
+  const last = candles[candles.length - 1];
+
+  if (last && last.t === t) {
+    return [
+      ...candles.slice(0, -1),
+      {
+        ...last,
+        high: Math.max(last.high, swap.price),
+        low: Math.min(last.low, swap.price),
+        close: swap.price,
+        volume0: last.volume0 + vol0,
+        volume1: last.volume1 + vol1,
+        n: last.n + 1,
+      },
+    ];
+  }
+
+  return [
+    ...candles,
+    {
+      t,
+      open: swap.price,
+      high: swap.price,
+      low: swap.price,
+      close: swap.price,
+      volume0: vol0,
+      volume1: vol1,
+      n: 1,
+    },
+  ];
+}
+
+export function useCandles(
+  apiUrl: string,
+  resolution: Resolution,
+  limit = 500
+) {
+  const bucketSeconds = BUCKET_SECONDS[resolution];
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [ready, setReady] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      const res = await fetch(
+        `${apiUrl}/pools/${POOL_ID}/candles?resolution=${resolution}&limit=${limit}`
+      );
+      const json = await res.json();
+      if (cancelled) return;
+      setCandles(json.candles);
+      setReady(true);
+
+      const wsUrl = apiUrl.replace(/^http/, "ws");
+      const ws = new WebSocket(`${wsUrl}/pools/${POOL_ID}/ws`);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type !== "swap") return;
+        setCandles((prev) =>
+          applySwap(prev, msg.data as SwapEvent, bucketSeconds)
+        );
+      };
+    })();
+
+    return () => {
+      cancelled = true;
+      wsRef.current?.close();
+    };
+  }, [apiUrl, resolution, limit, bucketSeconds]);
+
+  return { candles, ready };
+}
+```
+
+Hand `candles` to any OHLC library (`lightweight-charts`, `react-financial-charts`, `recharts`, etc.).
+
+#### Pool stats dashboard
+
+```tsx
+import { useEffect, useRef, useState } from "react";
+
+interface PoolState {
+  currency0Symbol: string;
+  currency1Symbol: string;
+  currency0Decimals: number;
+  currency1Decimals: number;
+  sqrtPriceX96: string;
+  tick: number;
+  liquidity: string;
+  reserve0: string;
+  reserve1: string;
+  blockNumber: string;
+  updatedAt: number;
+}
+
+const POOL_ID =
+  "0x363251ac1864e05ea6f839785a02ccaef52cd97f9e2b4516a4c47b638efb4257";
+
+function priceFromSqrtX96(sqrt: string, d0: number, d1: number): number {
+  const s = Number(BigInt(sqrt)) / Number(2n ** 96n);
+  return s * s * 10 ** (d0 - d1);
+}
+
+export function usePoolStats(apiUrl: string) {
+  const [pool, setPool] = useState<PoolState | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      const res = await fetch(`${apiUrl}/pools/${POOL_ID}`);
+      const json = await res.json();
+      if (cancelled) return;
+      if (json.pool) setPool(json.pool);
+
+      const wsUrl = apiUrl.replace(/^http/, "ws");
+      const ws = new WebSocket(`${wsUrl}/pools/${POOL_ID}/ws`);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "pool_state") setPool(msg.data);
+      };
+    })();
+
+    return () => {
+      cancelled = true;
+      wsRef.current?.close();
+    };
+  }, [apiUrl]);
+
+  const price = pool
+    ? priceFromSqrtX96(
+        pool.sqrtPriceX96,
+        pool.currency0Decimals,
+        pool.currency1Decimals
+      )
+    : null;
+
+  return { pool, price };
+}
+```
+
+### Common gotchas
+
+- **All large numbers are JSON strings.** `sqrtPriceX96`, `liquidity`, `amount0/1`, `reserve0/1`, `feeGrowth…`, `blockNumber` — wrap with `BigInt(...)` if you need integer math.
+- **`price` is already decimal-adjusted.** It's currency1 per currency0 with token decimals baked in. Don't re-multiply by `10^(d0 - d1)`.
+- **Two timestamps on swaps.** `blockTimestamp` is unix **seconds**, `timestamp` is unix **milliseconds**. Both are block-derived (not the time the server saw the event).
+- **Bucket boundaries are wall-clock based**, computed as `floor(blockTimestamp / bucketSeconds) * bucketSeconds`. They don't shift with `from`. Two clients hitting the same resolution get bucket-aligned candles.
+- **Sparse candles.** Empty buckets are omitted from the response — if continuous time is needed, fill gaps client-side.
+- **WS reconnects.** No special handling on the server side. If the browser drops, just reopen the WS; you'll get fresh `pool_state` and `recent_swaps` on the new connect. For the candle hook, also re-`GET /candles` to fill any gap from when the WS was down.
+- **`recentSwaps` is capped at 50.** For deeper history use `/candles` (chart use case) or, if you really need raw swaps further back, ask backend to expose a `/swaps?before=…&limit=…` endpoint — it isn't there yet.
+- **Server may answer `503` briefly on boot.** The first `pool_state` row is written when the first block tick hits after startup. UIs should handle "loading" until that's available.
