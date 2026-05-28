@@ -13,7 +13,7 @@ const app = new Elysia()
   .use(sponsor)
   .use(claim)
   .get("/", () => "Hello Elysia")
-  .listen(8001);
+  .listen({ hostname: "127.0.0.1", port: 8001 });
 
 console.log(
   `🦊 Elysia is running at http://${app.server?.hostname}:${app.server?.port}`
