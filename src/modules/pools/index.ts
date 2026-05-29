@@ -9,6 +9,15 @@ import {
 
 const MAX_CANDLES = 1000;
 const DEFAULT_CANDLES = 500;
+const MAX_USER_SWAPS = 500;
+const DEFAULT_USER_SWAPS = 100;
+
+const addressPattern = /^0x[a-fA-F0-9]{40}$/;
+
+const userSwapsQuerySchema = t.Object({
+  limit: t.Optional(t.Numeric({ minimum: 1, maximum: MAX_USER_SWAPS })),
+  before: t.Optional(t.Numeric({ minimum: 0 })),
+});
 
 const candleQuerySchema = t.Object({
   resolution: t.Union([
@@ -70,6 +79,27 @@ export const pools = new Elysia({ prefix: "/pools", name: "pools" })
       return { resolution, bucketSeconds, from, to, candles };
     },
     { query: candleQuerySchema }
+  )
+  .get(
+    "/:poolId/users/:address/swaps",
+    async ({ params: { poolId, address }, query, set }) => {
+      if (poolId !== SUPPORTED_POOL_ID) {
+        set.status = 404;
+        return { error: "Pool not found" };
+      }
+      if (!addressPattern.test(address)) {
+        set.status = 400;
+        return { error: "Invalid address" };
+      }
+      const limit = query.limit ?? DEFAULT_USER_SWAPS;
+      const swaps = await PoolsService.getUserSwaps({
+        address,
+        limit,
+        before: query.before,
+      });
+      return { address, limit, swaps };
+    },
+    { query: userSwapsQuerySchema }
   )
   .ws("/:poolId/ws", {
     open(ws) {

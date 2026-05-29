@@ -1,4 +1,4 @@
-import { eq, desc, sql } from "drizzle-orm";
+import { and, eq, desc, lt, sql } from "drizzle-orm";
 import { db } from "../../lib/db";
 import { poolMeta, poolStates, swaps } from "../../lib/schema";
 import { POOL_ID } from "../../config/pools";
@@ -202,6 +202,51 @@ async function readCandles({
   return rows;
 }
 
+interface UserSwapsQuery {
+  address: string;
+  limit: number;
+  before?: number;
+}
+
+async function readUserSwapsData({
+  address,
+  limit,
+  before,
+}: UserSwapsQuery): Promise<SwapEventData[]> {
+  const addrLower = address.toLowerCase();
+  const filters = [
+    eq(swaps.poolId, POOL_ID),
+    sql`lower(${swaps.userAddress}) = ${addrLower}`,
+  ];
+  if (before !== undefined) {
+    filters.push(lt(swaps.blockTimestamp, before));
+  }
+
+  const rows = await db
+    .select()
+    .from(swaps)
+    .where(and(...filters))
+    .orderBy(desc(swaps.blockNumber), desc(swaps.logIndex))
+    .limit(limit);
+
+  return rows.map((r) => ({
+    poolId: r.poolId,
+    sender: r.sender,
+    userAddress: r.userAddress,
+    amount0: r.amount0,
+    amount1: r.amount1,
+    sqrtPriceX96: r.sqrtPriceX96,
+    liquidity: r.liquidity,
+    tick: r.tick,
+    fee: r.fee,
+    price: r.price,
+    transactionHash: r.txHash,
+    blockNumber: String(r.blockNumber),
+    blockTimestamp: r.blockTimestamp,
+    timestamp: r.blockTimestamp * 1000,
+  }));
+}
+
 export abstract class PoolsService {
   static async getState(): Promise<PoolStateData | null> {
     return readPoolStateData();
@@ -209,6 +254,10 @@ export abstract class PoolsService {
 
   static async getRecentSwaps(limit?: number): Promise<SwapEventData[]> {
     return readRecentSwapsData(limit);
+  }
+
+  static async getUserSwaps(query: UserSwapsQuery): Promise<SwapEventData[]> {
+    return readUserSwapsData(query);
   }
 
   static async getCandles(query: CandleQuery): Promise<Candle[]> {

@@ -22,6 +22,8 @@ const sponsorAccount = privateKeyToAccount(
   HOT_MANAGER_WALLET_PRIVATE_KEY as `0x${string}`
 );
 
+export const HOT_MANAGER_WALLET_ADDRESS = sponsorAccount.address;
+
 const publicClient = createPublicClient({
   chain: arbitrumSepolia,
   transport: http(ARBITRUM_SEPOLIA_RPC_URL),

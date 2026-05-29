@@ -23,6 +23,7 @@ import {
   swapEventAbi,
   tokenMetaAbi,
 } from "../../config/pools";
+import { HOT_MANAGER_WALLET_ADDRESS } from "../sponsor/service";
 import type { PoolStateData, SwapEventData } from "./types";
 
 const ARBITRUM_SEPOLIA_RPC_URL = process.env.ARBITRUM_SEPOLIA_RPC_URL;
@@ -191,9 +192,17 @@ async function enrichSwapLogs(
     blockTimestamps.set(b.number, Number(b.timestamp));
   }
 
-  const txSenders = new Map<string, Address>();
+  const txUsers = new Map<string, Address>();
+  const hotWallet = HOT_MANAGER_WALLET_ADDRESS.toLowerCase();
   for (const tx of txResults) {
-    txSenders.set(tx.hash, tx.from);
+    // For sponsored swaps (EIP-7702), tx.from is the hot manager wallet and
+    // tx.to is the user's delegated EOA — the real trader. For all other
+    // swaps, tx.from is the user. tx.to is non-null here because every swap
+    // log comes from a tx that called a contract (router/EOA), never a
+    // contract-creation tx.
+    const user =
+      tx.from.toLowerCase() === hotWallet && tx.to ? tx.to : tx.from;
+    txUsers.set(tx.hash, user);
   }
 
   return logs.map((log) => {
@@ -203,7 +212,7 @@ async function enrichSwapLogs(
       meta.currency1Decimals
     );
     const blockTimestamp = blockTimestamps.get(log.blockNumber)!;
-    const userAddress = txSenders.get(log.transactionHash) ?? log.args.sender;
+    const userAddress = txUsers.get(log.transactionHash) ?? log.args.sender;
 
     const row = {
       txHash: log.transactionHash,
