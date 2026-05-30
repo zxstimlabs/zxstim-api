@@ -1,6 +1,7 @@
 import { Elysia } from "elysia";
 import { rpc } from "./modules/rpc";
 import { pools } from "./modules/pools";
+import { defi } from "./modules/defi";
 import { delegate } from "./modules/delegate";
 import { sponsor } from "./modules/sponsor";
 import { claim } from "./modules/claim";
@@ -8,6 +9,7 @@ import { claim } from "./modules/claim";
 const app = new Elysia()
   .use(rpc)
   .use(pools)
+  .use(defi)
   .use(delegate)
   .use(sponsor)
   .use(claim)

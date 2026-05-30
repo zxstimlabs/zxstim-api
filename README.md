@@ -1674,3 +1674,279 @@ export function usePoolStats(apiUrl: string) {
 - **WS reconnects.** No special handling on the server side. If the browser drops, just reopen the WS; you'll get fresh `pool_state` and `recent_swaps` on the new connect. For the candle hook, also re-`GET /candles` to fill any gap from when the WS was down.
 - **`recentSwaps` is capped at 50.** For deeper history use `/candles` (chart use case) or, if you really need raw swaps further back, ask backend to expose a `/swaps?before=…&limit=…` endpoint — it isn't there yet.
 - **Server may answer `503` briefly on boot.** The first `pool_state` row is written when the first block tick hits after startup. UIs should handle "loading" until that's available.
+
+## Pools Polling Integration (Frontend) — replaces the WebSocket
+
+This section supersedes the live-stream parts of the guide above. Instead of holding a `WS /pools/:poolId/ws` connection, the frontend polls a single REST endpoint, `GET /defi/pools/:poolId`, on a short interval (e.g. once per second). It returns exactly the data a fresh WS client receives on connect — current pool state plus the recent-swaps window — so the migration is a like-for-like swap with no loss of data.
+
+The historical/REST endpoints are unchanged: keep using `GET /pools/:poolId/candles` and `GET /pools/:poolId/users/:address/swaps` exactly as before. **Only the WebSocket is being replaced.**
+
+### Why polling here
+
+The server-side indexer already refreshes pool state at most once per second, so the WebSocket never pushed faster than that. Polling at ~1s matches that cadence with no extra latency, removes all connection lifecycle code (reconnect, heartbeats, missed-event gaps), and is stateless. The `/defi` endpoint is served from an in-memory snapshot refreshed by one cron tick per second, so it costs no per-request database work no matter how many clients poll.
+
+### Endpoint
+
+`GET /defi/pools/:poolId`
+
+| Query param | Required | Description |
+|---|---|---|
+| `filterAddress` | no | `0x…` (40 hex). Restricts `recentSwaps` to swaps where `userAddress` matches (case-insensitive). `poolState` is always returned in full. Omit for no filter. |
+
+**Response 200**
+
+```json
+{
+  "poolState": { /* same shape as the WS `pool_state` message `.data` */ },
+  "recentSwaps": [ /* SwapEvent[], oldest-first — same as the WS `recent_swaps` `.data` */ ],
+  "updatedAt": 1780125059005
+}
+```
+
+- `updatedAt` is the server time (unix **ms**) the in-memory snapshot was last refreshed from SQLite — useful for a "last updated" indicator and for spotting a stalled feed. (`poolState.updatedAt` is separate: it's the indexer DB row's timestamp.)
+- `recentSwaps` is capped at 50 and ordered oldest → newest, identical to the WS `recent_swaps` payload.
+
+**Status codes**
+
+| Status | Meaning | Frontend action |
+|---|---|---|
+| `200` | Fresh snapshot. Response carries an `ETag` header. | Render it; remember the `ETag`. |
+| `304` | Unchanged since your `If-None-Match`. Empty body. | Keep current state; do nothing. |
+| `404` | Wrong pool ID. | — |
+| `400` | Malformed `filterAddress`. | Fix the address. |
+| `503` | Booting; snapshot not ready yet. | Show "loading", keep polling. |
+
+### Conditional requests (skip unchanged payloads)
+
+Each `200` includes an `ETag`. Send it back as `If-None-Match` on the next poll; if nothing changed you get a `304` with an empty body and keep your current state. The ETag already accounts for `filterAddress`, so each filtered view caches independently.
+
+```
+GET /defi/pools/0x3632…4257
+→ 200, ETag: "272150346:…:50:0x7bca…:1780124709000"
+
+GET /defi/pools/0x3632…4257
+If-None-Match: "272150346:…:50:0x7bca…:1780124709000"
+→ 304 (empty body)
+```
+
+### Migration map
+
+| WebSocket (old) | Polling (new) |
+|---|---|
+| Open `WS /pools/:poolId/ws` | `GET /defi/pools/:poolId` every ~1s |
+| `pool_state` message `.data` | response `.poolState` |
+| `recent_swaps` message `.data` | response `.recentSwaps` |
+| live `swap` messages | diff `.recentSwaps` between polls (see below) |
+| send `{ "filterAddress": "0x…" }` | `?filterAddress=0x…` query param |
+| send `{ "filterAddress": null }` | omit the query param |
+| `onopen` / `onclose` / reconnect | none — each poll is independent |
+| `ws://` / `wss://` base URL | plain `http(s)://`, no protocol swap |
+
+### Detecting new swaps
+
+The WS pushed individual `swap` events. With polling, new swaps simply appear in `recentSwaps` on the next response. To turn the rolling window into an event stream (for a "recent trades" panel or candle updates), diff against what you've already seen using a per-swap key — `transactionHash` alone is **not** unique (a single tx can contain multiple swaps), so combine it with the amounts:
+
+```ts
+const swapKey = (s: SwapEvent) =>
+  `${s.transactionHash}:${s.sqrtPriceX96}:${s.amount0}:${s.amount1}`;
+```
+
+### Drop-in React examples (polling)
+
+These mirror the three hooks in the WebSocket guide above; the public API of each is unchanged, so call sites don't move. They share one small poller primitive.
+
+#### Shared poller
+
+```tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+
+const POOL_ID =
+  "0x363251ac1864e05ea6f839785a02ccaef52cd97f9e2b4516a4c47b638efb4257";
+
+interface PoolState {
+  currency0Symbol: string;
+  currency1Symbol: string;
+  currency0Decimals: number;
+  currency1Decimals: number;
+  sqrtPriceX96: string;
+  tick: number;
+  protocolFee: number;
+  lpFee: number;
+  liquidity: string;
+  feeGrowthGlobal0X128: string;
+  feeGrowthGlobal1X128: string;
+  reserve0: string;
+  reserve1: string;
+  blockNumber: string;
+  updatedAt: number;
+}
+
+interface SwapEvent {
+  poolId: string;
+  sender: string;
+  userAddress: string;
+  amount0: string;
+  amount1: string;
+  sqrtPriceX96: string;
+  liquidity: string;
+  tick: number;
+  fee: number;
+  price: number;
+  transactionHash: string;
+  blockNumber: string;
+  blockTimestamp: number;
+  timestamp: number;
+}
+
+// Polls GET /defi/pools/:poolId on an interval, using ETag/If-None-Match so
+// unchanged ticks return 304 and cost nothing. Chains setTimeout (not
+// setInterval) so a slow request never overlaps the next.
+export function usePoolSnapshot(
+  apiUrl: string,
+  opts: { filterAddress?: string; intervalMs?: number } = {}
+) {
+  const { filterAddress, intervalMs = 1000 } = opts;
+  const [poolState, setPoolState] = useState<PoolState | null>(null);
+  const [recentSwaps, setRecentSwaps] = useState<SwapEvent[]>([]);
+  const etagRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    etagRef.current = null; // reset when filter changes
+    const qs = filterAddress ? `?filterAddress=${filterAddress}` : "";
+
+    const tick = async () => {
+      try {
+        const res = await fetch(`${apiUrl}/defi/pools/${POOL_ID}${qs}`, {
+          // Manage conditional requests ourselves rather than via the HTTP cache.
+          cache: "no-store",
+          headers: etagRef.current
+            ? { "If-None-Match": etagRef.current }
+            : {},
+        });
+        if (!cancelled && res.status === 200) {
+          etagRef.current = res.headers.get("etag");
+          const json = await res.json();
+          setPoolState(json.poolState);
+          setRecentSwaps(json.recentSwaps);
+        }
+        // 304 → unchanged, keep current state. 503 → not ready yet, just retry.
+      } catch {
+        // network blip — swallow and retry on the next tick
+      } finally {
+        if (!cancelled) timer = setTimeout(tick, intervalMs);
+      }
+    };
+
+    tick();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [apiUrl, filterAddress, intervalMs]);
+
+  return { poolState, recentSwaps };
+}
+```
+
+#### Live swap feed — was `useSwapFeed`
+
+```tsx
+export function useSwapFeed(apiUrl: string, filterAddress?: string) {
+  const { recentSwaps } = usePoolSnapshot(apiUrl, { filterAddress });
+  // newest-first for the panel; the server keeps the window trimmed to 50.
+  return useMemo(() => recentSwaps.slice().reverse(), [recentSwaps]);
+}
+```
+
+#### Candlestick chart with live update — was `useCandles`
+
+Seed from `/pools/:poolId/candles` exactly as before, then fold each *new* swap from the poll into the trailing candle. `applySwap` and `BUCKET_SECONDS` are unchanged from the WebSocket guide above.
+
+```tsx
+export function useCandles(
+  apiUrl: string,
+  resolution: Resolution,
+  limit = 500
+) {
+  const bucketSeconds = BUCKET_SECONDS[resolution];
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [ready, setReady] = useState(false);
+  const { recentSwaps } = usePoolSnapshot(apiUrl);
+  const seenRef = useRef<Set<string>>(new Set());
+
+  // 1. Seed history (authoritative, from the DB).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const res = await fetch(
+        `${apiUrl}/pools/${POOL_ID}/candles?resolution=${resolution}&limit=${limit}`
+      );
+      const json = await res.json();
+      if (cancelled) return;
+      setCandles(json.candles);
+      seenRef.current = new Set();
+      setReady(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiUrl, resolution, limit]);
+
+  // 2. Apply only swaps we haven't folded in yet.
+  useEffect(() => {
+    if (!ready) return;
+    const fresh = recentSwaps.filter(
+      (s) =>
+        !seenRef.current.has(
+          `${s.transactionHash}:${s.sqrtPriceX96}:${s.amount0}:${s.amount1}`
+        )
+    );
+    if (fresh.length === 0) return;
+    setCandles((prev) => {
+      let next = prev;
+      for (const s of fresh) {
+        seenRef.current.add(
+          `${s.transactionHash}:${s.sqrtPriceX96}:${s.amount0}:${s.amount1}`
+        );
+        next = applySwap(next, s, bucketSeconds);
+      }
+      return next;
+    });
+  }, [recentSwaps, ready, bucketSeconds]);
+
+  return { candles, ready };
+}
+```
+
+#### Pool stats dashboard — was `usePoolStats`
+
+```tsx
+function priceFromSqrtX96(sqrt: string, d0: number, d1: number): number {
+  const s = Number(BigInt(sqrt)) / Number(2n ** 96n);
+  return s * s * 10 ** (d0 - d1);
+}
+
+export function usePoolStats(apiUrl: string) {
+  const { poolState } = usePoolSnapshot(apiUrl);
+  const price = poolState
+    ? priceFromSqrtX96(
+        poolState.sqrtPriceX96,
+        poolState.currency0Decimals,
+        poolState.currency1Decimals
+      )
+    : null;
+  return { pool: poolState, price };
+}
+```
+
+### Gotchas (polling-specific)
+
+- **Pick a sane interval.** ~1s matches the server's refresh cadence; faster gains nothing because the snapshot only changes once per second. Add a little random jitter to the first tick if you have many clients, so they don't all hit the same wall-clock second.
+- **Use the ETag.** Without `If-None-Match` every poll re-downloads the full snapshot; with it, unchanged seconds are a tiny `304`. The shared poller above does this for you.
+- **One poller per page is enough.** Each hook instance opens its own poll loop. If a page uses several of these hooks, lift `usePoolSnapshot` to a context/provider and share its result, rather than running N independent loops. (The server cost is flat either way — this is just client-side tidiness.)
+- **`filterAddress` filters the rolling 50-swap window**, mirroring the WS live filter — so a user with no trades among the pool's last 50 swaps returns an empty `recentSwaps`. For a user's *full* recent history regardless of pool volume, use `GET /pools/:poolId/users/:address/swaps` (DB-backed, paginated) instead.
+- **Very high swap volume.** If more than 50 swaps land between two polls, the intermediate ones roll off the window before you see them. The seeded `/candles` data is still authoritative; for a busy pool, periodically re-seed from `/candles` rather than relying solely on the live diff. Not a concern at current testnet volumes.
+- **No reconnect logic needed.** Each poll is independent and self-correcting — a missed or failed request just resolves on the next tick, with no gap to repair.
+- **All large numbers are still JSON strings** and `price` is still decimal-adjusted — the same number/precision rules as the WebSocket section apply unchanged.
