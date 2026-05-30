@@ -2,7 +2,6 @@ import { EventEmitter } from "node:events";
 import {
   createPublicClient,
   http,
-  webSocket,
   type Address,
   type PublicClient,
 } from "viem";
@@ -27,17 +26,14 @@ import { HOT_MANAGER_WALLET_ADDRESS } from "../sponsor/service";
 import type { PoolStateData, SwapEventData } from "./types";
 
 const ARBITRUM_SEPOLIA_RPC_URL = process.env.ARBITRUM_SEPOLIA_RPC_URL;
-const ARBITRUM_SEPOLIA_WSS_URL = process.env.ARBITRUM_SEPOLIA_WSS_URL;
 if (!ARBITRUM_SEPOLIA_RPC_URL) {
   throw new Error("ARBITRUM_SEPOLIA_RPC_URL is not set");
 }
-if (!ARBITRUM_SEPOLIA_WSS_URL) {
-  throw new Error("ARBITRUM_SEPOLIA_WSS_URL is not set");
-}
 
-// Backfill needs a permissive eth_getLogs range. Alchemy free tier caps it at 10 blocks,
-// so default to the Arbitrum Sepolia public RPC which accepts large ranges. Override via
-// BACKFILL_RPC_URL if you have a paid endpoint with higher limits.
+// Both the historical backfill and the live poll use eth_getLogs over a plain
+// HTTP RPC instead of an Alchemy WebSocket subscription (which burned compute
+// units). The public Arbitrum Sepolia RPC accepts large block ranges and is
+// free; override via BACKFILL_RPC_URL if you have a paid endpoint.
 const BACKFILL_RPC_URL =
   process.env.BACKFILL_RPC_URL ?? "https://sepolia-rollup.arbitrum.io/rpc";
 
@@ -47,17 +43,10 @@ const httpClient: PublicClient = createPublicClient({
   batch: { multicall: true },
 });
 
-const wssClient: PublicClient = createPublicClient({
-  chain: arbitrumSepolia,
-  transport: webSocket(ARBITRUM_SEPOLIA_WSS_URL),
-});
-
 const backfillClient: PublicClient = createPublicClient({
   chain: arbitrumSepolia,
   transport: http(BACKFILL_RPC_URL),
 });
-
-const CATCH_UP_INTERVAL_MS = 30_000;
 
 interface PoolMetaCache {
   currency0Symbol: string;
@@ -315,7 +304,9 @@ function stateSig(s: RawPoolState): string {
 }
 
 async function fetchPoolState(blockNumber: bigint): Promise<RawPoolState | null> {
-  const results = await httpClient.multicall({
+  // Read state over the public RPC (free) rather than Alchemy. The explicit
+  // multicall action calls Multicall3 directly, so it needs no batch config.
+  const results = await backfillClient.multicall({
     blockNumber,
     contracts: [
       {
@@ -361,7 +352,7 @@ async function fetchPoolState(blockNumber: bigint): Promise<RawPoolState | null>
     return null;
   }
 
-  const block = await httpClient.getBlock({ blockNumber, includeTransactions: false });
+  const block = await backfillClient.getBlock({ blockNumber, includeTransactions: false });
 
   return {
     sqrtPriceX96: slot0[0].toString(),
@@ -407,8 +398,8 @@ const emitter = new EventEmitter();
 
 export abstract class PoolIndexer {
   private static lastStateSig: string | null = null;
-  private static catchUpTimer: ReturnType<typeof setInterval> | null = null;
-  private static initialized = false;
+  private static ready = false;
+  private static polling = false;
 
   static on<E extends keyof PoolEvents>(event: E, listener: PoolEvents[E]): void {
     emitter.on(event, listener as (...args: unknown[]) => void);
@@ -428,12 +419,28 @@ export abstract class PoolIndexer {
     const cursor = await readCursor();
     const head = await backfillClient.getBlockNumber();
 
+    // A persisted cursor only ever advances from POOL_DEPLOY_BLOCK - 1, so this
+    // sentinel value means no progress was saved — i.e. a fresh DB.
+    const isFresh = cursor === POOL_DEPLOY_BLOCK - 1n;
+
     let from = cursor + 1n;
     if (from > head) {
       console.log(
         `[pools-indexer] backfill: up to date at block ${head} (cursor=${cursor})`
       );
       return;
+    }
+
+    if (isFresh) {
+      console.warn(
+        `[pools-indexer] no saved cursor — running a FULL backfill from deploy block ${POOL_DEPLOY_BLOCK}. ` +
+          `If you see this on EVERY restart, the DB at DATABASE_PATH is not persisting ` +
+          `(check that the path is absolute and on a durable volume).`
+      );
+    } else {
+      console.log(
+        `[pools-indexer] resuming from saved cursor ${cursor} — incremental catch-up`
+      );
     }
 
     console.log(
@@ -477,69 +484,85 @@ export abstract class PoolIndexer {
   }
 
   /**
-   * Start live indexing: WSS event subscriptions for swaps and block ticks,
-   * plus a 30s http catch-up poller that closes any gaps caused by WSS drops.
+   * Prepare for live polling: ensure the historical backfill has run, cache
+   * pool meta, and load the latest persisted pool-state signature. Once this
+   * resolves, `ready` is set and poll() begins doing work. Idempotent.
    */
-  static async startLive(): Promise<void> {
-    if (this.initialized) return;
-    this.initialized = true;
-
+  static async start(): Promise<void> {
+    if (this.ready) return;
+    await this.backfill();
     await ensurePoolMeta();
     this.lastStateSig = await readLatestPoolStateSig();
-
-    wssClient.watchContractEvent({
-      address: POOL_MANAGER,
-      abi: [swapEventAbi],
-      eventName: "Swap",
-      args: { id: POOL_ID },
-      onLogs: (logs) => {
-        this.ingestLiveSwapLogs(logs as unknown as SwapLog[]).catch((err) => {
-          console.error("[pools-indexer] live swap ingest error:", err);
-        });
-      },
-      onError: (err) => {
-        console.error("[pools-indexer] watchContractEvent error:", err);
-      },
-    });
-
-    wssClient.watchBlockNumber({
-      onBlockNumber: (blockNumber) => {
-        this.refreshPoolState(blockNumber).catch((err) => {
-          console.error("[pools-indexer] pool state refresh error:", err);
-        });
-      },
-      onError: (err) => {
-        console.error("[pools-indexer] watchBlockNumber error:", err);
-      },
-    });
-
-    this.catchUpTimer = setInterval(() => {
-      this.catchUp().catch((err) => {
-        console.error("[pools-indexer] catch-up error:", err);
-      });
-    }, CATCH_UP_INTERVAL_MS);
-
-    console.log(`[pools-indexer] live indexing started (catch-up every ${CATCH_UP_INTERVAL_MS / 1000}s)`);
+    this.ready = true;
+    console.log("[pools-indexer] ready; live polling enabled");
   }
 
-  private static async ingestLiveSwapLogs(logs: SwapLog[]): Promise<void> {
-    if (logs.length === 0) return;
-    const meta = await ensurePoolMeta();
-    const enriched = await enrichSwapLogs(logs, httpClient, meta);
-    const insertedKeys = await persistSwapRows(enriched.map((e) => e.row));
-
-    let maxBlock = 0n;
-    for (const { row, event } of enriched) {
-      const key = `${row.txHash}:${row.logIndex}`;
-      if (insertedKeys.has(key)) {
-        emitter.emit("swap", event);
-      }
-      if (BigInt(row.blockNumber) > maxBlock) maxBlock = BigInt(row.blockNumber);
+  /**
+   * One polling cycle, driven by the cron job every second. Reads the current
+   * head over HTTP, ingests any new Swap logs from the cursor up to head via
+   * eth_getLogs, then refreshes pool state at head. Returns early until start()
+   * has completed, and skips re-entrant ticks so a slow cycle never overlaps
+   * the next one.
+   */
+  static async poll(): Promise<void> {
+    if (!this.ready || this.polling) return;
+    this.polling = true;
+    try {
+      const head = await backfillClient.getBlockNumber();
+      await this.ingestNewSwaps(head);
+      await this.refreshPoolState(head);
+    } catch (err) {
+      console.error("[pools-indexer] poll error:", err);
+    } finally {
+      this.polling = false;
     }
+  }
 
-    if (insertedKeys.size > 0 && maxBlock > 0n) {
-      const cursor = await readCursor();
-      if (maxBlock > cursor) await writeCursor(maxBlock);
+  /**
+   * Ingest Swap logs from cursor+1 up to `head` via chunked eth_getLogs. Same
+   * chunked, cursor-per-chunk, dedup-on-insert flow as backfill, so any overlap
+   * is harmless and a crash mid-poll resumes cleanly.
+   */
+  private static async ingestNewSwaps(head: bigint): Promise<void> {
+    const meta = await ensurePoolMeta();
+    const cursor = await readCursor();
+
+    let from = cursor + 1n;
+    if (from > head) return;
+
+    while (from <= head) {
+      const to =
+        from + BACKFILL_CHUNK_SIZE - 1n > head
+          ? head
+          : from + BACKFILL_CHUNK_SIZE - 1n;
+
+      const logs = await backfillClient.getLogs({
+        address: POOL_MANAGER,
+        event: swapEventAbi,
+        args: { id: POOL_ID },
+        fromBlock: from,
+        toBlock: to,
+      });
+
+      if (logs.length > 0) {
+        // Enrich over the same (free) public RPC used for getLogs so the swap
+        // pipeline never touches Alchemy CU.
+        const enriched = await enrichSwapLogs(logs as SwapLog[], backfillClient, meta);
+        const insertedKeys = await persistSwapRows(enriched.map((e) => e.row));
+        if (insertedKeys.size > 0) {
+          console.log(
+            `[pools-indexer] poll ${from}-${to}: ${insertedKeys.size} new swaps`
+          );
+          for (const { row, event } of enriched) {
+            if (insertedKeys.has(`${row.txHash}:${row.logIndex}`)) {
+              emitter.emit("swap", event);
+            }
+          }
+        }
+      }
+
+      await writeCursor(to);
+      from = to + 1n;
     }
   }
 
@@ -574,52 +597,5 @@ export abstract class PoolIndexer {
 
     const meta = await ensurePoolMeta();
     emitter.emit("pool_state", buildPoolStateData(state, meta));
-  }
-
-  /**
-   * Periodic safety net for WSS drops: reads cursor + head over http, and if
-   * cursor is behind, runs the same chunked ingestion as backfill to close the
-   * gap. Dedup via PK means any overlap is harmless.
-   */
-  private static async catchUp(): Promise<void> {
-    const meta = await ensurePoolMeta();
-    const cursor = await readCursor();
-    const head = await backfillClient.getBlockNumber();
-
-    let from = cursor + 1n;
-    if (from > head) return;
-
-    while (from <= head) {
-      const to =
-        from + BACKFILL_CHUNK_SIZE - 1n > head
-          ? head
-          : from + BACKFILL_CHUNK_SIZE - 1n;
-
-      const logs = await backfillClient.getLogs({
-        address: POOL_MANAGER,
-        event: swapEventAbi,
-        args: { id: POOL_ID },
-        fromBlock: from,
-        toBlock: to,
-      });
-
-      if (logs.length > 0) {
-        const enriched = await enrichSwapLogs(logs as SwapLog[], backfillClient, meta);
-        const insertedKeys = await persistSwapRows(enriched.map((e) => e.row));
-        if (insertedKeys.size > 0) {
-          console.log(
-            `[pools-indexer] catch-up ${from}-${to}: ${insertedKeys.size} new swaps`
-          );
-          for (const { row, event } of enriched) {
-            if (insertedKeys.has(`${row.txHash}:${row.logIndex}`)) {
-              emitter.emit("swap", event);
-            }
-          }
-        }
-      }
-
-      await writeCursor(to);
-      from = to + 1n;
-    }
   }
 }

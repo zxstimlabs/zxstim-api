@@ -1,4 +1,5 @@
 import { Elysia, t } from "elysia";
+import { cron } from "@elysia/cron";
 import { cors } from "@elysiajs/cors";
 import {
   PoolsService,
@@ -6,6 +7,7 @@ import {
   SUPPORTED_POOL_ID,
   type CandleResolution,
 } from "./service";
+import { PoolIndexer } from "./indexer";
 
 const MAX_CANDLES = 1000;
 const DEFAULT_CANDLES = 500;
@@ -35,6 +37,19 @@ const candleQuerySchema = t.Object({
 
 export const pools = new Elysia({ prefix: "/pools", name: "pools" })
   .use(cors({ origin: true, credentials: false }))
+  // Live indexing: every second, fetch new Swap logs from the cursor up to the
+  // latest block via eth_getLogs and refresh pool state. poll() is a no-op until
+  // the backfill kicked off below finishes, and is re-entrancy-guarded so
+  // overlapping ticks are skipped.
+  .use(
+    cron({
+      name: "pool-indexer-poll",
+      pattern: "* * * * * *",
+      run() {
+        PoolIndexer.poll();
+      },
+    })
+  )
   .get("/:poolId", async ({ params: { poolId }, set }) => {
     if (poolId !== SUPPORTED_POOL_ID) {
       set.status = 404;
@@ -122,3 +137,14 @@ export const pools = new Elysia({ prefix: "/pools", name: "pools" })
       PoolsService.removeConnection(ws);
     },
   });
+
+// Run the historical backfill and prime indexer state once at module load, in
+// the background so server boot stays responsive. Until this resolves, the cron
+// poll above is a no-op; afterwards each tick ingests new blocks.
+void (async () => {
+  try {
+    await PoolIndexer.start();
+  } catch (err) {
+    console.error("[pools-indexer] startup failed:", err);
+  }
+})();

@@ -39,7 +39,7 @@ interface ClientInfo {
 const clients = new Map<any, ClientInfo>();
 
 // Forward indexer events to all WS subscribers. Set up at module load so the
-// subscription exists before the indexer's startLive() begins emitting.
+// subscription exists before the indexer's poll loop begins emitting.
 PoolIndexer.on("swap", (swap) => {
   const payload = JSON.stringify({ type: "swap", data: swap });
   for (const client of clients.values()) {
