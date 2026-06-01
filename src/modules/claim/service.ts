@@ -108,11 +108,22 @@ export abstract class ClaimService {
       const { amount, decimals } = CLAIMABLE_TOKENS[token];
       const value = parseUnits(amount, decimals);
 
+      const estimatedGas = await publicClient.estimateContractGas({
+        account: managerAccount,
+        address: token,
+        abi: erc20Abi,
+        functionName: "transfer",
+        args: [normalizedRequester, value],
+      });
+      // Add a 50% buffer plus a flat floor to stay safe against estimate drift.
+      const gas = estimatedGas + estimatedGas / 2n + 50_000n;
+
       const hash = await walletClient.writeContract({
         address: token,
         abi: erc20Abi,
         functionName: "transfer",
         args: [normalizedRequester, value],
+        gas,
       });
 
       const receipt = await publicClient.waitForTransactionReceipt({ hash });

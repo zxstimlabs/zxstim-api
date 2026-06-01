@@ -42,8 +42,13 @@ export abstract class DelegateService {
       account: sponsorAccount.address,
       to: authority,
       value: 0n,
+      // Include the authorization so the estimate covers the EIP-7702
+      // intrinsic gas (~25k per authorization); otherwise the estimate is
+      // too low and the tx reverts with "intrinsic gas too low".
+      authorizationList: [authorization],
     });
-    const gas = estimatedGas + estimatedGas / 5n + 30_000n;
+    // Add a 50% buffer plus a flat floor to stay safe against estimate drift.
+    const gas = estimatedGas + estimatedGas / 2n + 50_000n;
 
     const hash = await walletClient.sendTransaction({
       authorizationList: [authorization],
