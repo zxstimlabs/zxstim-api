@@ -1,9 +1,9 @@
 # CI/CD for zxstim-api
 #
-#   pull request → main/develop   build image → boot test
-#   push develop                  build → boot test → push image → deploy to "develop" (stack zxstim-api-dev, 127.0.0.1:8004)
+#   pull request → main/develop   test → build image → boot test
+#   push develop                  test → build → boot test → push image → deploy to "develop" (stack zxstim-api-dev, 127.0.0.1:8004)
 #                                 → smoke-test it on the server → tear it down (develop is throwaway)
-#   push main                     build → boot test → push image → deploy to "production" (stack zxstim-api, 127.0.0.1:8003)
+#   push main                     test → build → boot test → push image → deploy to "production" (stack zxstim-api, 127.0.0.1:8003)
 #
 # Deploys to the zxstim-rpc server (Tailscale machine zxstim-rpc), which it
 # shares with zxstimlabs/eth-rpc (127.0.0.1:8001 prod, 8002 develop), using
@@ -41,8 +41,35 @@ env:
   POOL_ID: "0x363251ac1864e05ea6f839785a02ccaef52cd97f9e2b4516a4c47b638efb4257"
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Throwaway Redis for the order-book store test (src/test/orderbook).
+    services:
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
   build:
     name: Build image + boot test
+    needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
