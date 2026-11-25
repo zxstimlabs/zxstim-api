@@ -1,0 +1,46 @@
+# zxstim-api: the app, with its SQLite DB on a named volume.
+#
+#   Run a published image:    IMAGE=ghcr.io/zxstimlabs/zxstim-api:<tag> docker compose -f deploy/compose.yaml up -d
+#   Build from this checkout: docker compose -f deploy/compose.yaml up -d --build
+#   Second copy side by side: add `-p <other-name>` and HOST_PORT=<other-port>
+#
+# Runs on the zxstim-rpc server next to the eth-rpc stacks, which hold
+# 127.0.0.1:8001 (prod) and 8002 (develop). This stack: 8003 (prod) and 8004
+# (develop).
+#
+# Secrets come from .env next to this file (written by CI, mode 600), never
+# from the image. HOST, PORT and DATABASE_PATH are set in the image.
+#
+# The DB lives in the volume <project>_data. `up`, `restart` and deploys keep
+# it; `down -v` deletes it (develop teardown does that on purpose).
+
+name: zxstim-api
+
+services:
+  app:
+    image: ${IMAGE:-zxstim-api:local}
+    build:
+      context: ..
+      target: runtime
+    env_file: [.env]
+    # Localhost only; nginx on the host terminates TLS and proxies here.
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8003}:8000"
+    volumes:
+      - data:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    # Shares the box with the RPC proxy and has no rate limiting of its own:
+    # cap it so a flood here can't starve the proxy.
+    cpus: 1.0
+    mem_limit: 512m
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  data: {}

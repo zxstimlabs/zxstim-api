@@ -1,0 +1,223 @@
+# CI/CD for zxstim-api
+#
+#   pull request → main/develop   build image → boot test
+#   push develop                  build → boot test → push image → deploy to "develop" (stack zxstim-api-dev, 127.0.0.1:8004)
+#                                 → smoke-test it on the server → tear it down (develop is throwaway)
+#   push main                     build → boot test → push image → deploy to "production" (stack zxstim-api, 127.0.0.1:8003)
+#
+# Deploys to the zxstim-rpc server (Tailscale machine zxstim-rpc), which it
+# shares with zxstimlabs/eth-rpc (127.0.0.1:8001 prod, 8002 develop), using
+# the same mechanics. Secrets live in the GitHub environment ("develop" |
+# "production"), which only its own branch can use. The runner joins the
+# tailnet with a Tailscale OIDC credential scoped to that environment
+# (tag:ci), so no long-lived secret exists. The access rules let tag:ci reach
+# only tag:server's SSH port, as user "deploy".
+#
+# Public repo ⇒ public logs: nothing here prints secrets or the deployed
+# containers' logs. (The boot test prints its own container's logs on
+# failure; that container only ever sees a random key and fake upstreams.)
+#
+# Third-party actions are pinned to full commit SHAs (version in the comment).
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+env:
+  IMAGE_NAME: ghcr.io/zxstimlabs/zxstim-api
+  BUN_VERSION: 1.4.5
+  POOL_ID: "0x363251ac1864e05ea6f839785a02ccaef52cd97f9e2b4516a4c47b638efb4257"
+
+jobs:
+  build:
+    name: Build image + boot test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: ref
+        run: echo "image=${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build once and load it locally: the boot test runs this exact image,
+      # and the push step below publishes it unchanged.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          load: true
+          push: false
+          provenance: false
+          build-args: BUN_VERSION=${{ env.BUN_VERSION }}
+          tags: ${{ steps.ref.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: |
+            type=gha,scope=main
+            type=gha,scope=${{ github.head_ref || github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ github.head_ref || github.ref_name }}
+
+      # No secrets: a random throwaway key and unreachable upstreams (the
+      # indexer fails to start, which is expected). Checks the image boots
+      # read-only as nonroot, migrates a fresh DB on a volume, and answers.
+      - name: Boot test
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker run -d --name boot --read-only --tmpfs /tmp -v boot-data:/data \
+            -p 127.0.0.1:8000:8000 \
+            -e ARBITRUM_SEPOLIA_RPC_URL=http://127.0.0.1:9 \
+            -e BACKFILL_RPC_URL=http://127.0.0.1:9 \
+            -e HOT_MANAGER_WALLET_PRIVATE_KEY="0x$(openssl rand -hex 32)" \
+            "$IMAGE" >/dev/null
+          base=http://127.0.0.1:8000
+          code() { curl -s -m 5 -o /dev/null -w '%{http_code}' "$@" || true; }
+          fails=0
+          check() { if [ "$1" = "$2" ]; then echo "  ✓ $3 ($1)"; else echo "  ✗ $3 (got '$1', want '$2')"; fails=$((fails + 1)); fi; }
+          for _ in $(seq 1 30); do [ "$(code "$base/health")" = 200 ] && break; sleep 1; done
+          check "$(code "$base/health")" 200 "GET /health"
+          # 503 "not yet available" (not 500) proves the migrations created the tables.
+          check "$(code "$base/pools/$POOL_ID")" 503 "GET /pools/<pool> on an empty DB"
+          check "$(code "$base/pools/0xdead")" 404 "GET /pools/<unknown pool>"
+          check "$(code "$base/pools/$POOL_ID/candles?resolution=1h")" 200 "GET /pools/<pool>/candles"
+          check "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 --http1.1 \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+            -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$base/pools/$POOL_ID/ws" || true)" 101 "WS /pools/<pool>/ws"
+          check "$(docker inspect -f '{{.Config.User}}' boot)" nonroot "runs as nonroot"
+          if [ $fails -gt 0 ]; then echo "--- container log"; docker logs boot 2>&1 | tail -n 40; fi
+          docker rm -f boot >/dev/null
+          exit $(( fails > 0 ))
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          branch_tag="${IMAGE_NAME}:${GITHUB_REF_NAME//\//-}"
+          docker tag "$IMAGE" "$branch_tag"
+          docker push --quiet "$IMAGE"
+          docker push --quiet "$branch_tag"
+
+  deploy:
+    name: Deploy (${{ github.ref_name == 'main' && 'production' || 'develop' }})
+    needs: build
+    if: github.event_name != 'pull_request' && (github.ref_name == 'main' || github.ref_name == 'develop')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ github.ref_name == 'main' && 'production' || 'develop' }}
+    # One deploy per environment at a time; a newer pending run replaces an older one.
+    concurrency:
+      group: deploy-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read # the server pulls the private image with this token (stdin → RAM-only Docker config)
+      id-token: write # Tailscale OIDC
+    env:
+      DEPLOY_HOST: zxstim-rpc.tail2e11cd.ts.net
+      STACK: ${{ github.ref_name == 'main' && 'zxstim-api' || 'zxstim-api-dev' }}
+      HOST_PORT: ${{ github.ref_name == 'main' && '8003' || '8004' }}
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Join tailnet (ephemeral, tag:ci)
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci
+          ping: ${{ env.DEPLOY_HOST }}
+
+      - name: Trust the server's SSH host key as published by Tailscale
+        run: |
+          ip=$(sudo tailscale ip -4 "$DEPLOY_HOST")
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          sudo tailscale status --json \
+            | jq -r --arg ip "$ip" '.Peer[] | select(.TailscaleIPs | index($ip)) | .sshHostKeys[]? | "\($ip) \(.)"' \
+            > ~/.ssh/known_hosts
+          [ -s ~/.ssh/known_hosts ] || { echo "::error::no SSH host keys published for $DEPLOY_HOST"; exit 1; }
+          cat > ~/.ssh/config <<EOF
+          Host server
+            HostName $ip
+            User deploy
+            BatchMode yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ConnectTimeout 20
+          EOF
+
+      - name: Upload compose file and scripts
+        run: |
+          ssh server "test -d /opt/$STACK -a -w /opt/$STACK" \
+            || { echo "::error::/opt/$STACK is missing or not writable by deploy (one-time server setup, see README)"; exit 1; }
+          ssh server "cat > /opt/$STACK/compose.yaml" < deploy/compose.yaml
+          ssh server "cat > /opt/$STACK/deploy.sh && chmod 700 /opt/$STACK/deploy.sh" < deploy/deploy.sh
+          ssh server "cat > /opt/$STACK/smoke-test.sh && chmod 700 /opt/$STACK/smoke-test.sh" < deploy/smoke-test.sh
+
+      - name: Write .env from environment secrets
+        env:
+          ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
+          HOT_MANAGER_WALLET_PRIVATE_KEY: ${{ secrets.HOT_MANAGER_WALLET_PRIVATE_KEY }}
+        run: |
+          vars="ARBITRUM_SEPOLIA_RPC_URL HOT_MANAGER_WALLET_PRIVATE_KEY"
+          for v in $vars; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is empty in environment ${{ github.ref_name == 'main' && 'production' || 'develop' }}"; exit 1; }
+          done
+          for v in $vars; do printf '%s=%s\n' "$v" "${!v}"; done \
+            | ssh server "umask 077; cat > /opt/$STACK/.env.next"
+
+      - name: Pull, restart, health check (rolls back on failure)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | ssh server "/opt/$STACK/deploy.sh $STACK $HOST_PORT $IMAGE"
+
+      - name: Verify from the server
+        run: ssh server "curl -fsS http://127.0.0.1:$HOST_PORT/health && echo"
+
+      # develop is a throwaway test environment: test the live stack on the
+      # server, then remove it (container, DB volume, network, and the .env
+      # holding secrets). Production keeps running and is never smoke-tested
+      # (the smoke test recreates the container).
+      - name: Smoke test on the server (develop only)
+        if: github.ref_name == 'develop'
+        run: ssh server "/opt/$STACK/smoke-test.sh $STACK $HOST_PORT"
+
+      - name: Tear down the test stack (develop only, always)
+        if: always() && github.ref_name == 'develop'
+        run: |
+          [ -f ~/.ssh/config ] || { echo "never connected to the server; nothing to tear down"; exit 0; }
+          ssh server "cd /opt/$STACK && docker compose -p $STACK -f compose.yaml down -v --remove-orphans --timeout 10 2>&1 | tail -n 3; rm -f .env .env.next .env.prev .image; echo 'left in /opt/$STACK:' \$(ls)"
