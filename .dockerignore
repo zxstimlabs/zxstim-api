@@ -1,0 +1,12 @@
+# Keep the build context to what the Dockerfile copies; never send env files or DBs.
+.git
+.github
+.agents
+.claude
+node_modules
+build
+deploy
+*.md
+.env*
+*.db
+*.db-*

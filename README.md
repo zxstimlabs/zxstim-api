@@ -13,122 +13,50 @@ Server runs at http://localhost:8001
 
 ## Environment Variables
 
-Create a `.env.local` file:
+Copy `.env.example` to `.env.local` and fill it in:
 
 ```
 DATABASE_PATH=./sqlite.db
 ARBITRUM_SEPOLIA_RPC_URL=https://arb-sepolia.g.alchemy.com/v2/<YOUR_KEY>
-ARBITRUM_SEPOLIA_WSS_URL=wss://arb-sepolia.g.alchemy.com/v2/<YOUR_KEY>
 HOT_MANAGER_WALLET_PRIVATE_KEY=0x<YOUR_PRIVATE_KEY>
-HOT_MANAGER_WALLET_ADDRESS=0x<YOUR_ADDRESS>
 ```
 
-On the production server use the same keys but in a file named `.env.production`. The deploy script and systemd unit both reference that filename — see the Deployment section below.
+- The hot manager wallet's address is derived from the key; there is no separate address variable.
+- Optional: `BACKFILL_RPC_URL` (indexer backfill/poll endpoint, defaults to the public Arbitrum Sepolia RPC), `HOST` / `PORT` (default `127.0.0.1:8001`; the container image sets `0.0.0.0:8000`).
+- On startup the server applies any pending migrations from `./drizzle` (relative to the working directory). Generate migrations locally with `bun db:generate` and commit them; nothing generates migrations on the server.
 
 ## Deployment
 
-A `deploy.sh` script lives at the repo root and handles each redeploy: `git pull`, `bun install`, generate + apply migrations, compile a single binary into `./build/zxstim-api`, restart the systemd service. Everything lives inside the repo directory — code, binary, and database — and that whole directory is the unit of backup.
+Production runs on the **zxstim-rpc** server (Hetzner, Tailscale machine `zxstim-rpc`) next to [eth-rpc](https://github.com/zxstimlabs/eth-rpc), with the same pipeline. `.github/workflows/ci-cd.yml` — push to deploy, nothing manual:
 
-### Layout on the server
+| Event | Jobs | Target |
+|---|---|---|
+| PR into `main` / `develop` | build image → boot test | — |
+| push `develop` | build → boot test → push → deploy → **smoke test on the server → tear down** | GitHub env **develop** → stack `zxstim-api-dev` on `127.0.0.1:8004`. Throwaway: removed with its DB volume and `.env` |
+| push `main` | build → boot test → push → deploy | GitHub env **production** → stack `zxstim-api` on `127.0.0.1:8003` (nginx: `api.zxstim.com`) |
 
-```
-/home/ubuntu/zxstim-api/
-├── src/                      # source (from git)
-├── drizzle/                  # migrations (from git)
-├── build/zxstim-api          # compiled binary (gitignored, rebuilt by deploy.sh)
-├── sqlite.db                 # database (gitignored, persists across deploys)
-├── sqlite.db-wal             # SQLite WAL (gitignored)
-├── sqlite.db-shm             # SQLite SHM (gitignored)
-├── .env.production           # secrets (gitignored, hand-maintained)
-└── deploy.sh                 # this script
-```
+Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api prod, `8004` zxstim-api develop.
 
-`.env.production`, `build/`, and `sqlite.db*` are all in `.gitignore`, so `git pull` never touches them.
+- **Image:** `ghcr.io/zxstimlabs/zxstim-api:<commit-sha>` (+ `:<branch>`), the `Dockerfile` `runtime` target: the compiled binary plus `drizzle/` on distroless, as nonroot. It contains no secrets.
+- **Boot test** (every run, PRs too): runs the built image read-only with a random throwaway key and unreachable upstreams, and checks `/health`, that migrations created the tables (`/pools/<id>` → 503, not 500), 404/candles/WebSocket routes, and nonroot. Only an image that passed is pushed.
+- **Secrets** (`ARBITRUM_SEPOLIA_RPC_URL`, `HOT_MANAGER_WALLET_PRIVATE_KEY`) live in the GitHub environment and reach the server only at deploy time, as `/opt/<stack>/.env` (mode 600).
+- **Data:** SQLite at `/data/sqlite.db` on the named volume `<stack>_data`. Deploys, restarts and `up` keep it. Never run `docker compose down -v` on production.
+- **Access:** the runner joins Tailscale with a per-environment OIDC credential as `tag:ci`, which may only SSH to `tag:server` as user `deploy`. The server has no public SSH.
+- **On the server:** `deploy/deploy.sh` (same script as eth-rpc's) swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
+- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); the DB survives a container recreate (the indexer resumes from its saved cursor).
+- **Shared box:** the container is capped at 1 CPU / 512 MB so a flood on this API can't starve the RPC proxy.
+- **Rollback by hand:** re-run the workflow for an earlier commit, or on the server: `IMAGE=<old ref> HOST_PORT=8003 docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml up -d`.
+- **Logs:** on the server, `docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml logs app`. Workflow logs are public (public repo): nothing in the pipeline prints secrets or the deployed container's logs.
 
-### One-time server setup (run on the server, not locally)
+### One-time setup
 
-1. **Install Bun, Git, and ensure sudo is available** for the deploy user (default assumption: `ubuntu`).
+- **GitHub:** environments `production` (branch `main` only) and `develop` (branch `develop` only), each with secrets `ARBITRUM_SEPOLIA_RPC_URL` and `HOT_MANAGER_WALLET_PRIVATE_KEY`, and variables `TS_CLIENT_ID` / `TS_AUDIENCE` from a Tailscale OIDC federated credential (tag `tag:ci`, issuer GitHub Actions, subject `repo:zxstimlabs/zxstim-api:environment:<env>`).
+- **Server** (as root): `install -d -o deploy -g deploy -m 750 /opt/zxstim-api /opt/zxstim-api-dev`.
+- **nginx + TLS:** `deploy/nginx.conf` → `/etc/nginx/sites-available/zxstim-api`, symlinked into `sites-enabled`. Its header lists the certbot steps.
 
-2. **Clone the repo** to the expected path (the deploy script hard-codes this):
+### The database and the indexer backfill
 
-    ```bash
-    git clone <repo-url> /home/ubuntu/zxstim-api
-    cd /home/ubuntu/zxstim-api
-    ```
-
-3. **Create `.env.production`** in the repo root (gitignored — never commit it). Mirror `.env.local` but with production values. The simplest `DATABASE_PATH` is `./sqlite.db` — since the systemd unit sets `WorkingDirectory=/home/ubuntu/zxstim-api`, that resolves to `/home/ubuntu/zxstim-api/sqlite.db`.
-
-4. **Make `deploy.sh` executable** (only needed once — git doesn't track the executable bit reliably across platforms):
-
-    ```bash
-    chmod +x /home/ubuntu/zxstim-api/deploy.sh
-    ```
-
-5. **Create the systemd unit** at `/etc/systemd/system/zxstim-api.service`:
-
-    ```ini
-    [Unit]
-    Description=zxstim-api
-    After=network.target
-
-    [Service]
-    Type=simple
-    User=ubuntu
-    WorkingDirectory=/home/ubuntu/zxstim-api
-    EnvironmentFile=/home/ubuntu/zxstim-api/.env.production
-    ExecStart=/home/ubuntu/zxstim-api/build/zxstim-api
-    Restart=on-failure
-    RestartSec=5s
-
-    [Install]
-    WantedBy=multi-user.target
-    ```
-
-    Then enable it:
-
-    ```bash
-    sudo systemctl daemon-reload
-    sudo systemctl enable zxstim-api.service
-    ```
-
-6. **Grant passwordless sudo** for the systemctl calls in `deploy.sh` (otherwise the script will pause for a password):
-
-    ```
-    # /etc/sudoers.d/zxstim-api
-    ubuntu ALL=(ALL) NOPASSWD: /bin/systemctl restart zxstim-api.service, /bin/systemctl status zxstim-api.service
-    ```
-
-7. **First deploy** — run `./deploy.sh` once. The migration step will create `sqlite.db`, the build step will produce `build/zxstim-api`, and the service will start.
-
-### Each redeploy
-
-```bash
-ssh <server>
-cd /home/ubuntu/zxstim-api
-./deploy.sh
-```
-
-### Things that should be done locally (not on the server)
-
-- **`bun db:generate`.** Schema migrations should be generated locally where there's a TTY for rename/delete disambiguation, then committed alongside the schema change. The deploy script runs `db:generate` as a safety net, but if it ever needs to disambiguate it will fail on the server (no TTY). Treat any "generate produced changes on server" as a sign you forgot to commit a migration.
-
-### Backing up the database
-
-The DB lives at `/home/ubuntu/zxstim-api/sqlite.db`. Take a hot backup with:
-
-```bash
-sqlite3 /home/ubuntu/zxstim-api/sqlite.db ".backup /path/to/backup.db"
-```
-
-(`cp` works too, but the `.backup` command handles in-flight writes correctly with WAL mode enabled.)
-
-**Don't `rm -rf` the repo or `git clean -fdx` it** — both will delete `sqlite.db`. Use `git pull` (which respects `.gitignore`) and let `deploy.sh` do the rest.
-
-### Troubleshooting
-
-- **Service won't start** → `journalctl -u zxstim-api.service -e` for the latest output. Most common causes: missing `.env.production`, `sqlite.db` not writable, or binary path mismatch in the unit file.
-- **`deploy.sh` exits at migration** → check the generated SQL in `drizzle/` matches the schema in git; the wrong commit may be checked out.
-- **WSS / RPC errors after deploy** → confirm `ARBITRUM_SEPOLIA_WSS_URL` and `ARBITRUM_SEPOLIA_RPC_URL` in `.env.production`. The indexer fails fast if either is unset.
+Everything in the DB is derived from chain data, so it isn't backed up. But a **fresh DB starts a full backfill** from block 271232501: tens of millions of blocks, in 5000-block `eth_getLogs` chunks, which takes tens of minutes, and `/pools` returns 503 until it finishes. To move or rebuild production without that gap, seed the volume with a copy of an existing DB: stop the app, put a consistent copy (`sqlite3 <db> ".backup <copy>"`) at `/data/sqlite.db` in the volume, owned by uid 65532, and start it again. It resumes from the saved cursor.
 
 ## Pools WebSocket Integration
 
