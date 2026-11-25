@@ -10,11 +10,12 @@
 //   BETTER_AUTH_SECRET             ≥ 32 chars; signs cookies/tokens (GitHub env secret)
 //   CEFI_PIN_PEPPER                ≥ 32 chars; never change it (GitHub env secret)
 //   REDIS_URL                      sessions cache, rate limits, PIN lockout
+//   CEFI_DATABASE_PATH             the CeFi accounts DB (image: /cefi/cefi.db; local default ./cefi.db)
 //   CEFI_BASE_URL, CEFI_RP_ID      override for local dev (http://localhost:8002, localhost)
 //   CEFI_EXTRA_ORIGINS             comma-separated extra web origins for local dev
 
 import { CEFI } from "../../config/cefi";
-import { db, sqlite } from "../../lib/db";
+import { openCefiDb } from "./db";
 import { createCefiApp } from "./app";
 import { createCefiAuth } from "./auth";
 import { RedisStorage } from "./storage";
@@ -42,6 +43,7 @@ export function startCefi(hostname: string): void {
   const extra = (process.env.CEFI_EXTRA_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const origins = [...CEFI.origins, ...extra];
 
+  const { sqlite, db } = openCefiDb(process.env.CEFI_DATABASE_PATH ?? "./cefi.db");
   const storage = new RedisStorage(redisUrl);
   const auth = createCefiAuth({
     db,

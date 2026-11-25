@@ -2,9 +2,7 @@
 // in-memory SQLite (with this repo's migrations) and in-memory storage.
 
 import { describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { openCefiDb } from "../../modules/cefi/db";
 import { CEFI } from "../../config/cefi";
 import { normalizeAccountNumber } from "../../modules/cefi/account";
 import { createCefiApp } from "../../modules/cefi/app";
@@ -16,8 +14,7 @@ const PIN = "135790";
 let ipSeq = 0;
 
 function setup() {
-  const db = drizzle(new Database(":memory:"));
-  migrate(db, { migrationsFolder: "./drizzle" });
+  const { db } = openCefiDb(":memory:");
   const storage = new MemoryStorage();
   const origins = [...CEFI.origins];
   const auth = createCefiAuth({

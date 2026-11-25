@@ -10,11 +10,13 @@
 # (develop).
 #
 # Secrets come from .env next to this file (written by CI, mode 600), never
-# from the image. HOST, PORT and DATABASE_PATH are set in the image.
+# from the image. HOST, PORT and the DB paths are set in the image.
 #
-# The DB lives in the volume <project>_data and the order book in
-# <project>_redis-data. `up`, `restart` and deploys keep both; `down -v`
-# deletes them (develop teardown does that on purpose).
+# Volumes: <project>_data (DeFi indexer DB, disposable: rebuilt from chain),
+# <project>_cefi-data (CeFi accounts DB: real accounts, back it up) and
+# <project>_redis-data (order book, session cache). `up`, `restart` and
+# deploys keep all three; `down -v` deletes them (develop teardown does that
+# on purpose). Never `down -v` production.
 
 name: zxstim-api
 
@@ -77,6 +79,7 @@ services:
       - "127.0.0.1:${CEFI_HOST_PORT:-8005}:8001"
     volumes:
       - data:/data
+      - cefi-data:/cefi
     restart: unless-stopped
     read_only: true
     tmpfs: [/tmp]
@@ -94,3 +97,4 @@ services:
 volumes:
   data: {}
   redis-data: {}
+  cefi-data: {}

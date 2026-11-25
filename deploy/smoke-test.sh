@@ -122,6 +122,10 @@ pre() {
 check "$(pre "$corigin")" "$corigin" "CORS preflight allows $corigin"
 check "$(pre https://evil.example)" "" "CORS preflight allows no other origin"
 [ "$(redis --scan --pattern 'cefi:*' | grep -c .)" -gt 0 ] && pass "auth state is in this stack's Redis (cefi:*)" || fail "no cefi:* keys in Redis"
+# A second account (the first one is now locked) for the CeFi DB persistence
+# check after the recreate: signing in needs the user + PIN rows from cefi.db.
+check "$(cpost /accounts '{"pin":"246802"}' 192.0.2.16)" 201 "POST /accounts (second account)"
+acct2=$(sed -n 's/.*"accountNumber":"\([^"]*\)".*/\1/p' "$hdr.body")
 
 echo "== DB survives a container recreate (named volume)"
 # Wait for the indexer to start backfilling (it saves its cursor per chunk),
@@ -153,6 +157,7 @@ else
   [ "$(seq_now)" -gt "${s3:-0}" ] 2>/dev/null && pass "bot active again after recreate" || fail "bot not active after recreate"
   for _ in $(seq 1 15); do [ "$(code "$cb/health")" = 200 ] && break; sleep 1; done
   [ -n "$canon" ] && [ "$(session_user "$cookie")" = "$canon" ] && pass "CeFi session survives the app recreate" || fail "CeFi session lost on app recreate"
+  check "$(cpost /auth/sign-in/username "{\"username\":\"$acct2\",\"password\":\"246802\"}" 192.0.2.17)" 200 "CeFi accounts DB survives the app recreate (PIN sign-in)"
 fi
 rm -f "$hdr" "$hdr.body"
 

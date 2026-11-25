@@ -41,7 +41,15 @@ Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api
 - **Tests** (every run): `bun test` (engine, bot, persistence) with a throwaway Redis service, so the Redis store's Lua script is exercised too.
 - **Boot test** (every run, PRs too): runs the built image read-only with a random throwaway key and unreachable upstreams, and checks `/health`, that migrations created the tables (`/pools/<id>` → 503, not 500), 404/candles/WebSocket routes, and nonroot. Only an image that passed is pushed.
 - **Secrets** (`ARBITRUM_SEPOLIA_RPC_URL`, `HOT_MANAGER_WALLET_PRIVATE_KEY`, `BETTER_AUTH_SECRET`, `CEFI_PIN_PEPPER`) live in the GitHub environment and reach the server only at deploy time, as `/opt/<stack>/.env` (mode 600).
-- **Data:** SQLite at `/data/sqlite.db` on the named volume `<stack>_data`, and the order book in the stack's own Redis (append-only file on `<stack>_redis-data`; not shared with eth-rpc's Redis). Deploys, restarts and `up` keep both. Never run `docker compose down -v` on production.
+- **Data:** two separate SQLite files, each on its own volume, plus the stack's own Redis (not shared with eth-rpc's):
+
+  | Store | Volume | Holds | If lost |
+  |---|---|---|---|
+  | `/data/sqlite.db` | `<stack>_data` | DeFi indexer (pool meta, swaps, states, cursor); migrations `drizzle/` | Rebuilt from chain (a long backfill) |
+  | `/cefi/cefi.db` | `<stack>_cefi-data` | CeFi accounts, PIN hashes, sessions, passkeys; migrations `drizzle-cefi/` | **Accounts gone: back it up** |
+  | Redis (append-only file) | `<stack>_redis-data` | Order book, CeFi session cache, rate limits, PIN lockouts | Book reseeds; users sign in again |
+
+  Deploys, restarts and `up` keep all three. Never run `docker compose down -v` on production.
 - **Access:** the runner joins Tailscale with a per-environment OIDC credential as `tag:ci`, which may only SSH to `tag:server` as user `deploy`. The server has no public SSH.
 - **On the server:** `deploy/deploy.sh` (same script as eth-rpc's) swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
 - **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); the order-book bot is saving to Redis (AOF on); the CeFi API creates an account, signs in with the PIN, locks after 5 wrong PINs, hides the raw sign-up route, and allows only the CeFi origins; the DB, the book and a CeFi session survive an app recreate, and the book survives a Redis restart.
@@ -56,9 +64,11 @@ Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api
 - **nginx + TLS:** `deploy/nginx.conf` → `/etc/nginx/sites-available/zxstim-api` and `deploy/nginx-cefi.conf` → `/etc/nginx/sites-available/zxstim-cefi`, symlinked into `sites-enabled`. Their headers list the certbot steps.
 - **DNS:** `api.zxstim.com` and `api.cefi.vn` → the zxstim-rpc server (178.105.70.39).
 
-### The database and the indexer backfill
+### The databases: the DeFi indexer backfill, and CeFi backups
 
-Everything in the DB is derived from chain data, so it isn't backed up. But a **fresh DB starts a full backfill** from block 271232501: tens of millions of blocks, in 5000-block `eth_getLogs` chunks, which takes tens of minutes, and `/pools` returns 503 until it finishes. To move or rebuild production without that gap, seed the volume with a copy of an existing DB: stop the app, put a consistent copy (`sqlite3 <db> ".backup <copy>"`) at `/data/sqlite.db` in the volume, owned by uid 65532, and start it again. It resumes from the saved cursor.
+Everything in the **DeFi** DB is derived from chain data, so it isn't backed up. But a **fresh DeFi DB starts a full backfill** from block 271232501: tens of millions of blocks, in 5000-block `eth_getLogs` chunks, which takes tens of minutes, and `/pools` returns 503 until it finishes. To move or rebuild production without that gap, seed the volume with a copy of an existing DB: stop the app, put a consistent copy (`sqlite3 <db> ".backup <copy>"`) at `/data/sqlite.db` in the volume, owned by uid 65532, and start it again. It resumes from the saved cursor.
+
+The **CeFi** DB is the opposite: it holds accounts that can't be recreated. **It is not backed up yet.** Options: Hetzner's server backups (whole box, daily), or a scheduled `sqlite3 /cefi/cefi.db ".backup …"` copied off the box. Sessions are also cached in Redis, but accounts and PIN hashes exist only in this file.
 
 ## ETH/VND order book (matching engine + bot)
 
@@ -77,7 +87,7 @@ For the CeFi simulator web app (cefi.vn, sim.cefi.vn until the move). Separate f
 
 - **Separate listener.** A second Elysia app in the same process, on container port 8001 (`src/modules/cefi`). It can't be a module of the main app: `@elysiajs/cors` hooks are global, and the DeFi modules' "reflect any origin, no credentials" CORS would answer CeFi's preflights and break cookie auth. Here CORS is credentialed and limited to `https://cefi.vn` and `https://sim.cefi.vn`.
 - **Same-site cookies.** The API is on `api.cefi.vn`, the same site as the web app, so the session cookie (`__Secure-cefi.session_token`, httpOnly, SameSite=Lax) is first-party. The web app calls with `fetch(…, { credentials: "include" })`.
-- **[Better Auth](https://www.better-auth.com) 1.7** (`src/modules/cefi/auth.ts`): `username` plugin (the account number is the username, the PIN is the password) and `@better-auth/passkey` (rpID `cefi.vn`, discoverable + biometric, so one tap signs in without typing the number). Its user table requires an email, so each account gets a `<number>@account.cefi.invalid` placeholder. Tables `cefi_user`, `cefi_session`, `cefi_account`, `cefi_passkey` live in the shared SQLite DB (generated schema `src/modules/cefi/schema.ts`; regenerate with the command in its header, then `bun db:generate`). Sessions are stored in SQLite and cached in the stack's Redis, with rate limits and verification data, all under `cefi:`.
+- **[Better Auth](https://www.better-auth.com) 1.7** (`src/modules/cefi/auth.ts`): `username` plugin (the account number is the username, the PIN is the password) and `@better-auth/passkey` (rpID `cefi.vn`, discoverable + biometric, so one tap signs in without typing the number). Its user table requires an email, so each account gets a `<number>@account.cefi.invalid` placeholder. Tables `cefi_user`, `cefi_session`, `cefi_account`, `cefi_passkey` live in **their own SQLite file**, `CEFI_DATABASE_PATH` (`/cefi/cefi.db` in the image, `./cefi.db` locally), separate from the DeFi indexer DB: opened and migrated (`drizzle-cefi/`) only when the CeFi API starts. Generated schema `src/modules/cefi/schema.ts`; regenerate with the command in its header, then `bun db:generate:cefi`. Sessions are stored in SQLite and cached in the stack's Redis, with rate limits and verification data, all under `cefi:`.
 - **Account numbers:** 16 Crockford base32 characters (80 random bits), shown as `K7Q2-9XMR-4TDA-WZ3P`; typed input may use any case, spaces or dashes, and I/L/O for 1/0. Treat them as secret: never show one publicly (use a display name).
 - **PINs:** exactly 6 digits, enforced at sign-up, sign-in and change. Hashed with argon2id (19 MiB) over an HMAC with `CEFI_PIN_PEPPER`, so a leaked DB alone can't be brute-forced. **Never change the pepper**: every PIN would stop working.
 - **Limits:** 5 wrong PINs for an account within an hour → PIN sign-in locked 15 min, doubling per lock up to 24 h (passkeys still work; unknown numbers are counted the same way). Per IP: 10 PIN sign-ins/min, 5 new accounts/hour, 60 auth requests/min. IPs come from nginx's `X-Real-IP`; without it all clients share one bucket.

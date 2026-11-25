@@ -43,3 +43,6 @@ package-lock.json
 sqlite.db
 sqlite.db-shm
 sqlite.db-wal
+cefi.db
+cefi.db-shm
+cefi.db-wal
