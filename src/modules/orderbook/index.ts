@@ -18,7 +18,10 @@ import { OrderbookBot } from "./bot";
 import { BookStateError, RedisBookStore, type BookStore } from "./store";
 
 const LOG = `[orderbook ${ORDERBOOK_MARKET}]`;
-const LOAD_RETRY_MS = 5_000;
+// Load retries back off from 0.5 s to 5 s: quick through a blip at boot,
+// gentle through a real outage.
+const LOAD_RETRY_FIRST_MS = 500;
+const LOAD_RETRY_MAX_MS = 5_000;
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -61,6 +64,7 @@ export async function loadRunner(
   rng: () => number = Math.random,
 ): Promise<OrderbookRunner | null> {
   let warned = false;
+  let delay = LOAD_RETRY_FIRST_MS;
   for (;;) {
     try {
       const saved = await store.load();
@@ -80,10 +84,11 @@ export async function loadRunner(
         return null;
       }
       if (!warned) {
-        console.error(`${LOG} Redis unavailable, retrying every ${LOAD_RETRY_MS / 1000}s: ${message(err)}`);
+        console.error(`${LOG} Redis unavailable, retrying (up to every ${LOAD_RETRY_MAX_MS / 1000}s): ${message(err)}`);
         warned = true;
       }
-      await Bun.sleep(LOAD_RETRY_MS);
+      await Bun.sleep(delay);
+      delay = Math.min(delay * 2, LOAD_RETRY_MAX_MS);
     }
   }
 }

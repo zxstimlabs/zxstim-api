@@ -97,7 +97,16 @@ else
     sleep 1
   done
   [ -n "$resumed" ] && pass "indexer resumed from its saved cursor" || fail "indexer did not resume from a saved cursor (DB not persisted?)"
-  log_has "[orderbook ETH-VND] restored" && pass "order book restored from Redis after recreate" || fail "order book was not restored after recreate"
+  restored=""; for i in $(seq 1 20); do
+    log_has "[orderbook ETH-VND] restored" && { restored=$i; break; }
+    log_has "[orderbook ETH-VND] no saved book" && break
+    log_has "[orderbook ETH-VND] saved book is invalid" && break
+    sleep 1
+  done
+  [ -n "$restored" ] && pass "order book restored from Redis after recreate (seen within ~${restored}s)" || fail "order book was not restored after recreate"
+  # The bot's own fixed-format lines (counts, sequence, Redis error text; no
+  # secrets) so a slow or failed boot is diagnosable from the public log.
+  compose logs --no-color --no-log-prefix app 2>/dev/null | grep -F '[orderbook ETH-VND]' | cut -c1-200 | sed 's/^/    log: /'
   s3=$(seq_now); sleep 2
   [ "$(seq_now)" -gt "${s3:-0}" ] 2>/dev/null && pass "bot active again after recreate" || fail "bot not active after recreate"
 fi
