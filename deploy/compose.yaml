@@ -61,6 +61,9 @@ services:
     env_file: [.env]
     environment:
       REDIS_URL: redis://redis:6379
+      # CeFi API (api.cefi.vn) on container port 8001. Needs BETTER_AUTH_SECRET
+      # and CEFI_PIN_PEPPER in .env; the app refuses to start without them.
+      CEFI_ENABLED: "1"
     depends_on:
       redis:
         condition: service_healthy
@@ -68,8 +71,10 @@ services:
     # instead of waiting out stop_grace_period.
     init: true
     # Localhost only; nginx on the host terminates TLS and proxies here.
+    # CEFI_HOST_PORT comes from .env (the workflow writes it): 8005 prod, 8006 develop.
     ports:
       - "127.0.0.1:${HOST_PORT:-8003}:8000"
+      - "127.0.0.1:${CEFI_HOST_PORT:-8005}:8001"
     volumes:
       - data:/data
     restart: unless-stopped

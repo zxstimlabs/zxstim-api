@@ -9,8 +9,11 @@
     "db:migrate": "bun run src/lib/migrate.ts"
   },
   "dependencies": {
+    "@better-auth/drizzle-adapter": "1.7.26",
+    "@better-auth/passkey": "1.7.26",
     "@elysia/cron": "^1.4.2",
     "@elysiajs/cors": "1.4.1",
+    "better-auth": "1.7.26",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "elysia": "latest",

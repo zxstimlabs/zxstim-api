@@ -6,7 +6,7 @@
 // Each save is ONE atomic Lua call, so readers never see half a step, and a
 // crash between steps loses at most the step in flight.
 
-import { RedisClient } from "bun";
+import { LazyRedis } from "../../lib/redis";
 import type { RestingOrder } from "../../lib/matching-engine";
 import type { BookChanges, BotState } from "./bot";
 
@@ -118,20 +118,18 @@ return n
 `;
 
 export class RedisBookStore implements BookStore {
-  private client: RedisClient | null = null;
+  private readonly redis: LazyRedis;
   private readonly ordersKey: string;
   private readonly metaKey: string;
 
-  constructor(
-    private readonly url: string,
-    prefix: string,
-  ) {
+  constructor(url: string, prefix: string) {
+    this.redis = new LazyRedis(url);
     this.ordersKey = `${prefix}:orders`;
     this.metaKey = `${prefix}:meta`;
   }
 
   async load(): Promise<PersistedBook | null> {
-    const [orders, meta] = await this.run((c) =>
+    const [orders, meta] = await this.redis.run((c) =>
       Promise.all([c.hgetall(this.ordersKey), c.hgetall(this.metaKey)]),
     );
     return decodeBook(orders ?? {}, meta ?? {});
@@ -147,34 +145,12 @@ export class RedisBookStore implements BookStore {
     ];
     for (const o of c.upserts) args.push(o.id, encodeOrder(o));
     args.push(...c.deletes);
-    await this.run((client) =>
+    await this.redis.run((client) =>
       client.send("EVAL", [SAVE_SCRIPT, "2", this.ordersKey, this.metaKey, ...args]),
     );
   }
 
   close(): void {
-    this.client?.close();
-    this.client = null;
-  }
-
-  // Connect on first use. On any failure drop the client so the next call
-  // reconnects from scratch, however long Redis was away. No offline queue:
-  // while Redis is down calls fail fast instead of piling up in memory.
-  private async run<T>(fn: (c: RedisClient) => Promise<T>): Promise<T> {
-    try {
-      if (!this.client) {
-        const client = new RedisClient(this.url, {
-          autoReconnect: false,
-          enableOfflineQueue: false,
-          connectionTimeout: 5_000,
-        });
-        await client.connect();
-        this.client = client;
-      }
-      return await fn(this.client);
-    } catch (err) {
-      this.close();
-      throw err;
-    }
+    this.redis.close();
   }
 }

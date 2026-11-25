@@ -35,25 +35,26 @@ Production runs on the **zxstim-rpc** server (Hetzner, Tailscale machine `zxstim
 | push `develop` | test → build → boot test → push → deploy → **smoke test on the server → tear down** | GitHub env **develop** → stack `zxstim-api-dev` on `127.0.0.1:8004`. Throwaway: removed with its volumes and `.env` |
 | push `main` | test → build → boot test → push → deploy | GitHub env **production** → stack `zxstim-api` on `127.0.0.1:8003` (nginx: `api.zxstim.com`) |
 
-Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api prod, `8004` zxstim-api develop.
+Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api prod, `8004` zxstim-api develop, `8005` CeFi API prod (nginx: `api.cefi.vn`), `8006` CeFi API develop.
 
 - **Image:** `ghcr.io/zxstimlabs/zxstim-api:<commit-sha>` (+ `:<branch>`), the `Dockerfile` `runtime` target: the compiled binary plus `drizzle/` on distroless, as nonroot. It contains no secrets.
 - **Tests** (every run): `bun test` (engine, bot, persistence) with a throwaway Redis service, so the Redis store's Lua script is exercised too.
 - **Boot test** (every run, PRs too): runs the built image read-only with a random throwaway key and unreachable upstreams, and checks `/health`, that migrations created the tables (`/pools/<id>` → 503, not 500), 404/candles/WebSocket routes, and nonroot. Only an image that passed is pushed.
-- **Secrets** (`ARBITRUM_SEPOLIA_RPC_URL`, `HOT_MANAGER_WALLET_PRIVATE_KEY`) live in the GitHub environment and reach the server only at deploy time, as `/opt/<stack>/.env` (mode 600).
+- **Secrets** (`ARBITRUM_SEPOLIA_RPC_URL`, `HOT_MANAGER_WALLET_PRIVATE_KEY`, `BETTER_AUTH_SECRET`, `CEFI_PIN_PEPPER`) live in the GitHub environment and reach the server only at deploy time, as `/opt/<stack>/.env` (mode 600).
 - **Data:** SQLite at `/data/sqlite.db` on the named volume `<stack>_data`, and the order book in the stack's own Redis (append-only file on `<stack>_redis-data`; not shared with eth-rpc's Redis). Deploys, restarts and `up` keep both. Never run `docker compose down -v` on production.
 - **Access:** the runner joins Tailscale with a per-environment OIDC credential as `tag:ci`, which may only SSH to `tag:server` as user `deploy`. The server has no public SSH.
 - **On the server:** `deploy/deploy.sh` (same script as eth-rpc's) swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
-- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); the order-book bot is saving to Redis (AOF on); the DB and the book survive an app recreate (indexer resumes from its cursor, book restored), and the book survives a Redis restart.
+- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); the order-book bot is saving to Redis (AOF on); the CeFi API creates an account, signs in with the PIN, locks after 5 wrong PINs, hides the raw sign-up route, and allows only the CeFi origins; the DB, the book and a CeFi session survive an app recreate, and the book survives a Redis restart.
 - **Shared box:** the app is capped at 1 CPU / 512 MB and its Redis at 0.5 CPU / 256 MB, so a flood on this API can't starve the RPC proxy.
 - **Rollback by hand:** re-run the workflow for an earlier commit, or on the server: `IMAGE=<old ref> HOST_PORT=8003 docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml up -d`.
 - **Logs:** on the server, `docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml logs app`. Workflow logs are public (public repo): nothing in the pipeline prints secrets or the deployed container's logs.
 
 ### One-time setup
 
-- **GitHub:** environments `production` (branch `main` only) and `develop` (branch `develop` only), each with secrets `ARBITRUM_SEPOLIA_RPC_URL` and `HOT_MANAGER_WALLET_PRIVATE_KEY`, and variables `TS_CLIENT_ID` / `TS_AUDIENCE` from a Tailscale OIDC federated credential (tag `tag:ci`, issuer GitHub Actions, subject `repo:zxstimlabs@161289539/zxstim-api@1250901918:environment:<env>`; the repo uses GitHub's immutable OIDC subject format, like eth-rpc).
+- **GitHub:** environments `production` (branch `main` only) and `develop` (branch `develop` only), each with secrets `ARBITRUM_SEPOLIA_RPC_URL`, `HOT_MANAGER_WALLET_PRIVATE_KEY`, `BETTER_AUTH_SECRET` and `CEFI_PIN_PEPPER` (the last two random, ≥ 32 chars, different per environment), and variables `TS_CLIENT_ID` / `TS_AUDIENCE` from a Tailscale OIDC federated credential (tag `tag:ci`, issuer GitHub Actions, subject `repo:zxstimlabs@161289539/zxstim-api@1250901918:environment:<env>`; the repo uses GitHub's immutable OIDC subject format, like eth-rpc).
 - **Server** (as root): `install -d -o deploy -g deploy -m 750 /opt/zxstim-api /opt/zxstim-api-dev`.
-- **nginx + TLS:** `deploy/nginx.conf` → `/etc/nginx/sites-available/zxstim-api`, symlinked into `sites-enabled`. Its header lists the certbot steps.
+- **nginx + TLS:** `deploy/nginx.conf` → `/etc/nginx/sites-available/zxstim-api` and `deploy/nginx-cefi.conf` → `/etc/nginx/sites-available/zxstim-cefi`, symlinked into `sites-enabled`. Their headers list the certbot steps.
+- **DNS:** `api.zxstim.com` and `api.cefi.vn` → the zxstim-rpc server (178.105.70.39).
 
 ### The database and the indexer backfill
 
@@ -69,6 +70,33 @@ A price-time-priority limit order book for one market, **ETH/VND**, kept alive b
 - **Off without `REDIS_URL`** (local dev, the CI boot test). To run it locally: `redis-server` then `REDIS_URL=redis://localhost:6379 bun run dev`.
 - **Reset the book** (on the server): `docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml exec redis redis-cli DEL orderbook:ETH-VND:orders orderbook:ETH-VND:meta`, then restart the app; it seeds a fresh book.
 - **Logs** only state changes (`[orderbook ETH-VND] seeded / restored / Redis save failed / Redis is back`), never per step.
+
+## CeFi API (api.cefi.vn): accounts without email
+
+For the CeFi simulator web app (cefi.vn, sim.cefi.vn until the move). Separate from the DeFi app: own users, no wallets. **An account is a server-generated account number; users sign in with it plus a 6-digit PIN, or with a passkey.** No email, no verification.
+
+- **Separate listener.** A second Elysia app in the same process, on container port 8001 (`src/modules/cefi`). It can't be a module of the main app: `@elysiajs/cors` hooks are global, and the DeFi modules' "reflect any origin, no credentials" CORS would answer CeFi's preflights and break cookie auth. Here CORS is credentialed and limited to `https://cefi.vn` and `https://sim.cefi.vn`.
+- **Same-site cookies.** The API is on `api.cefi.vn`, the same site as the web app, so the session cookie (`__Secure-cefi.session_token`, httpOnly, SameSite=Lax) is first-party. The web app calls with `fetch(…, { credentials: "include" })`.
+- **[Better Auth](https://www.better-auth.com) 1.7** (`src/modules/cefi/auth.ts`): `username` plugin (the account number is the username, the PIN is the password) and `@better-auth/passkey` (rpID `cefi.vn`, discoverable + biometric, so one tap signs in without typing the number). Its user table requires an email, so each account gets a `<number>@account.cefi.invalid` placeholder. Tables `cefi_user`, `cefi_session`, `cefi_account`, `cefi_passkey` live in the shared SQLite DB (generated schema `src/modules/cefi/schema.ts`; regenerate with the command in its header, then `bun db:generate`). Sessions are stored in SQLite and cached in the stack's Redis, with rate limits and verification data, all under `cefi:`.
+- **Account numbers:** 16 Crockford base32 characters (80 random bits), shown as `K7Q2-9XMR-4TDA-WZ3P`; typed input may use any case, spaces or dashes, and I/L/O for 1/0. Treat them as secret: never show one publicly (use a display name).
+- **PINs:** exactly 6 digits, enforced at sign-up, sign-in and change. Hashed with argon2id (19 MiB) over an HMAC with `CEFI_PIN_PEPPER`, so a leaked DB alone can't be brute-forced. **Never change the pepper**: every PIN would stop working.
+- **Limits:** 5 wrong PINs for an account within an hour → PIN sign-in locked 15 min, doubling per lock up to 24 h (passkeys still work; unknown numbers are counted the same way). Per IP: 10 PIN sign-ins/min, 5 new accounts/hour, 60 auth requests/min. IPs come from nginx's `X-Real-IP`; without it all clients share one bucket.
+
+| Route | |
+|---|---|
+| `POST /accounts` `{ pin }` | 201 `{ accountNumber }` + session cookie. Needs a CeFi `Origin`. |
+| `POST /auth/sign-in/username` `{ username, password }` | Account number + PIN |
+| `GET /auth/passkey/generate-register-options`, `POST /auth/passkey/verify-registration` | Add a passkey (signed in) |
+| `GET /auth/passkey/generate-authenticate-options`, `POST /auth/passkey/verify-authentication` | Sign in with a passkey |
+| `GET /auth/get-session`, `POST /auth/sign-out` | Session |
+| `POST /auth/change-password` `{ currentPassword, newPassword }` | Change PIN |
+| `GET /auth/list-sessions`, `POST /auth/revoke-session`, `POST /auth/revoke-other-sessions` | Devices |
+| `GET /auth/passkey/list-user-passkeys`, `POST /auth/passkey/update-passkey`, `POST /auth/passkey/delete-passkey` | Manage passkeys |
+| `GET /health` | 200 while SQLite and Redis answer |
+
+Every other `/auth/*` path is 404 (`AUTH_PATHS` in `src/modules/cefi/app.ts`), including all email, password-reset and social routes and the raw `/auth/sign-up/email`. The web app can use Better Auth's client (`createAuthClient({ baseURL: "https://api.cefi.vn/auth", plugins: [usernameClient(), passkeyClient()] })`, with `credentials: "include"`) for everything except account creation, which is a plain `fetch` to `/accounts`.
+
+**Local dev:** `redis-server`, then `CEFI_ENABLED=1 CEFI_BASE_URL=http://localhost:8002 CEFI_RP_ID=localhost CEFI_EXTRA_ORIGINS=http://localhost:5173 BETTER_AUTH_SECRET=… CEFI_PIN_PEPPER=… REDIS_URL=redis://localhost:6379 bun run dev` (see `.env.example`).
 
 ## Pools WebSocket Integration
 

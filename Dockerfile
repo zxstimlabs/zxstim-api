@@ -32,7 +32,9 @@ COPY drizzle ./drizzle
 COPY --from=build --chown=65532:65532 /out/data /data
 ENV HOST=0.0.0.0 \
     PORT=8000 \
+    CEFI_PORT=8001 \
     DATABASE_PATH=/data/sqlite.db
 USER nonroot
-EXPOSE 8000
+# 8000: main API (api.zxstim.com). 8001: CeFi API (api.cefi.vn), only when CEFI_ENABLED=1.
+EXPOSE 8000 8001
 ENTRYPOINT ["/app/zxstim-api"]

@@ -2,7 +2,7 @@ import { defineConfig } from "drizzle-kit";
 
 export default defineConfig({
   dialect: "sqlite",
-  schema: "./src/lib/schema.ts",
+  schema: ["./src/lib/schema.ts", "./src/modules/cefi/schema.ts"],
   out: "./drizzle",
   dbCredentials: {
     url: process.env.DATABASE_PATH ?? "./sqlite.db",

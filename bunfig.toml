@@ -1,0 +1,5 @@
+[install]
+# Only install package versions published at least 7 days ago
+minimumReleaseAge = 604800
+# Save exact versions to package.json on `bun add` (no ^/~ ranges)
+exact = true
