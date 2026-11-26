@@ -98,11 +98,11 @@ describe("Market: user orders", () => {
   test("a resting limit buy locks price × quantity; cancelling gives it back", () => {
     const { market, sqlite } = setup();
     const price = bestBid(market) - toTicks(BOT.tickVnd);
-    const order = ok(market.placeOrder("alice", { side: "buy", type: "limit", price, quantity: lots(0.5) }));
-    expect(order).toMatchObject({ status: "open", filled: 0, quantity: 0.5 });
+    const order = ok(market.placeOrder("alice", { side: "buy", type: "limit", price, quantity: lots(0.05) }));
+    expect(order).toMatchObject({ status: "open", filled: 0, quantity: 0.05 });
     const a = market.accountState("alice")!;
-    expect(a.vnd).toBe(START_VND - price * lots(0.5));
-    expect(market.account("alice").balances.vnd.locked).toBe(Number(price * lots(0.5)) / 1e6);
+    expect(a.vnd).toBe(START_VND - price * lots(0.05));
+    expect(market.account("alice").balances.vnd.locked).toBe(Number(price * lots(0.05)) / 1e6);
     expect(market.bot.engine.getOrder(order.id)).toBeDefined();
     assertConsistent(market, sqlite, ["alice"]);
 
@@ -118,7 +118,7 @@ describe("Market: user orders", () => {
   test("a crossing limit buy fills at the makers' prices and refunds the difference", () => {
     const { market, sqlite } = setup();
     const ask = market.bot.engine.snapshot().asks[0]!;
-    const q = ask.remaining < lots(0.5) ? ask.remaining : lots(0.5);
+    const q = ask.remaining < lots(0.05) ? ask.remaining : lots(0.05);
     const limit = ask.price + toTicks(10 * BOT.tickVnd);
     const order = ok(market.placeOrder("bob", { side: "buy", type: "limit", price: limit, quantity: q }));
     expect(order.status).toBe("filled");
@@ -131,12 +131,12 @@ describe("Market: user orders", () => {
 
   test("market buy and sell settle against the book", () => {
     const { market, sqlite } = setup();
-    const buy = ok(market.placeOrder("carol", { side: "buy", type: "market", quantity: lots(0.3) }));
+    const buy = ok(market.placeOrder("carol", { side: "buy", type: "market", quantity: lots(0.03) }));
     expect(buy.status).toBe("filled");
     expect(buy.price).toBeNull();
     const a = market.accountState("carol")!;
-    expect(a.eth).toBe(START_ETH + lots(0.3));
-    const sell = ok(market.placeOrder("carol", { side: "sell", type: "market", quantity: lots(1.3) }));
+    expect(a.eth).toBe(START_ETH + lots(0.03));
+    const sell = ok(market.placeOrder("carol", { side: "sell", type: "market", quantity: START_ETH + lots(0.03) }));
     expect(sell.status).toBe("filled");
     expect(a.eth).toBe(0n);
     assertConsistent(market, sqlite, ["carol"]);
@@ -165,9 +165,9 @@ describe("Market: user orders", () => {
     const { market } = setup();
     const price = bestBid(market) - toTicks(BOT.tickVnd * 20);
     for (let i = 0; i < USERS.maxOpenOrders; i++) {
-      ok(market.placeOrder("erin", { side: "buy", type: "limit", price, quantity: lots(0.01) }));
+      ok(market.placeOrder("erin", { side: "buy", type: "limit", price, quantity: lots(0.001) }));
     }
-    const r = market.placeOrder("erin", { side: "buy", type: "limit", price, quantity: lots(0.01) });
+    const r = market.placeOrder("erin", { side: "buy", type: "limit", price, quantity: lots(0.001) });
     expect(r.ok ? "ok" : r.code).toBe("too_many_orders");
     expect(market.cancelAll("erin")).toBe(USERS.maxOpenOrders);
     expect(market.accountState("erin")!.vnd).toBe(START_VND);
@@ -183,8 +183,9 @@ describe("Market: user orders", () => {
     const { market, bot, sqlite } = setup(11);
     const deep = bestBid(market) - toTicks(BOT.tickVnd * 30); // far below every bot level
     const near = bestAsk(market) + toTicks(BOT.tickVnd); // likely to be hit
-    const a = ok(market.placeOrder("gail", { side: "buy", type: "limit", price: deep, quantity: lots(0.1) }));
-    const b = ok(market.placeOrder("gail", { side: "sell", type: "limit", price: near, quantity: lots(0.5) }));
+    ok(market.placeOrder("gail", { side: "buy", type: "market", quantity: lots(0.02) })); // accounts start with no ETH
+    const a = ok(market.placeOrder("gail", { side: "buy", type: "limit", price: deep, quantity: lots(0.05) }));
+    const b = ok(market.placeOrder("gail", { side: "sell", type: "limit", price: near, quantity: lots(0.02) }));
     for (let i = 0; i < 2000; i++) bot.step();
     const history = market.account("gail").orderHistory;
     for (const o of history) expect(o.status).toBe("filled");
@@ -204,7 +205,7 @@ describe("Market: user orders", () => {
       if (rng() < 0.15) {
         const user = users[Math.floor(rng() * users.length)]!;
         const side = rng() < 0.5 ? "buy" : "sell";
-        const quantity = BigInt(10 + Math.floor(rng() * 3000)); // 0.001–0.301 ETH
+        const quantity = BigInt(10 + Math.floor(rng() * 300)); // 0.001–0.031 ETH
         const r =
           rng() < 0.3
             ? market.placeOrder(user, { side, type: "market", quantity })
@@ -337,13 +338,13 @@ describe("persistence: book, money and trades in one DB", () => {
     const { sqlite, db } = newDb();
     const first = loadRunner(db, mulberry32(7), now)!;
     const deep = first.bot.engine.snapshot().bids[0]!.price - toTicks(BOT.tickVnd * 30);
-    const order = ok(first.market.placeOrder("q1", { side: "buy", type: "limit", price: deep, quantity: lots(0.2) }));
+    const order = ok(first.market.placeOrder("q1", { side: "buy", type: "limit", price: deep, quantity: lots(0.05) }));
     trade(first, clock, 200);
     sqlite.run("DELETE FROM cefi_book_order");
     sqlite.run("DELETE FROM cefi_book_state");
 
     const second = loadRunner(db, mulberry32(8), now)!;
-    expect(second.bot.engine.getOrder(order.id)?.remaining).toBe(lots(0.2));
+    expect(second.bot.engine.getOrder(order.id)?.remaining).toBe(lots(0.05));
     expect(second.market.account("q1")).toEqual(first.market.account("q1"));
     expect(second.bot.engine.sequence).toBeGreaterThanOrEqual(db.maxTradeSeq()); // trade ids continue
     assertConsistent(second.market, sqlite, ["q1", "p1", "p2"]);
@@ -358,7 +359,7 @@ describe("persistence: book, money and trades in one DB", () => {
       const { sqlite, db } = newDb();
       const r = loadRunner(db, mulberry32(10))!;
       const deep = r.bot.engine.snapshot().bids[0]!.price - toTicks(BOT.tickVnd * 30);
-      const order = ok(r.market.placeOrder("r1", { side: "buy", type: "limit", price: deep, quantity: lots(0.2) }));
+      const order = ok(r.market.placeOrder("r1", { side: "buy", type: "limit", price: deep, quantity: lots(0.05) }));
       return { sqlite, db, order };
     };
     const missing = setupWithOrder();
@@ -386,12 +387,12 @@ describe("persistence: book, money and trades in one DB", () => {
     const bot = new OrderbookBot(new MatchingEngine(), mulberry32(12));
     bot.seed();
     const market = new Market(bot, flaky, Date.now, { reseeded: true });
-    ok(market.placeOrder("w1", { side: "buy", type: "market", quantity: lots(0.1) }));
+    ok(market.placeOrder("w1", { side: "buy", type: "market", quantity: lots(0.02) }));
     broken = true;
-    expect(() => market.placeOrder("w1", { side: "buy", type: "market", quantity: lots(0.1) })).toThrow("disk full");
+    expect(() => market.placeOrder("w1", { side: "buy", type: "market", quantity: lots(0.02) })).toThrow("disk full");
     expect(market.healthy).toBe(false);
     broken = false;
-    expect(() => market.placeOrder("w1", { side: "buy", type: "market", quantity: lots(0.1) })).toThrow("market stopped");
+    expect(() => market.placeOrder("w1", { side: "buy", type: "market", quantity: lots(0.02) })).toThrow("market stopped");
     expect(() => {
       for (let i = 0; i < 50; i++) bot.step(); // the bot's next trade hits the stopped market
     }).toThrow("market stopped");
@@ -399,7 +400,7 @@ describe("persistence: book, money and trades in one DB", () => {
 
   test("prune drops old trades, never users' fills; keeps the newest candles", () => {
     const { market, bot, advance, sqlite, db } = setup(13);
-    ok(market.placeOrder("v1", { side: "buy", type: "market", quantity: lots(0.1) }));
+    ok(market.placeOrder("v1", { side: "buy", type: "market", quantity: lots(0.02) }));
     for (let i = 0; i < 200; i++) {
       bot.step();
       advance(61_000); // a new 1m candle on most steps

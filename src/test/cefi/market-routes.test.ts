@@ -123,15 +123,15 @@ describe("signed-in trading", () => {
 
     const bid = runner!.bot.engine.snapshot().bids[0]!.price / 100n;
     const price = String(bid - 500_000n);
-    const placed = await c.call("POST", "/me/orders", { side: "buy", type: "limit", price, quantity: "0.25" });
+    const placed = await c.call("POST", "/me/orders", { side: "buy", type: "limit", price, quantity: "0.05" });
     expect(placed.status).toBe(201);
-    expect(placed.json.order).toMatchObject({ side: "buy", type: "limit", price: Number(price), quantity: 0.25, status: "open" });
+    expect(placed.json.order).toMatchObject({ side: "buy", type: "limit", price: Number(price), quantity: 0.05, status: "open" });
 
     const after = await c.call("GET", "/me/account", undefined, { "if-none-match": etag });
     expect(after.status).toBe(200);
     expect(after.json.openOrders).toHaveLength(1);
-    expect(after.json.balances.vnd.locked).toBe(Number(price) * 0.25);
-    expect(after.json.balances.vnd.available).toBe(USERS.startVnd - Number(price) * 0.25);
+    expect(after.json.balances.vnd.locked).toBe((Number(price) * 5) / 100);
+    expect(after.json.balances.vnd.available).toBe(USERS.startVnd - (Number(price) * 5) / 100);
 
     const id = placed.json.order.id;
     const cancelled = await c.call("DELETE", `/me/orders/${id}`);
@@ -147,16 +147,16 @@ describe("signed-in trading", () => {
   test("a market buy fills, shows up as trades, and is in the DB before the response", async () => {
     const { signedIn, sqlite } = await setup();
     const c = await signedIn();
-    const r = await c.call("POST", "/me/orders", { side: "buy", type: "market", quantity: 0.1 });
+    const r = await c.call("POST", "/me/orders", { side: "buy", type: "market", quantity: 0.05 });
     expect(r.status).toBe(201);
-    expect(r.json.order).toMatchObject({ status: "filled", filled: 0.1, price: null });
+    expect(r.json.order).toMatchObject({ status: "filled", filled: 0.05, price: null });
     expect(r.json.order.avgPrice).toBeGreaterThan(0);
     const acct = await c.call("GET", "/me/account");
-    expect(acct.json.balances.eth.available).toBeCloseTo(USERS.startEth + 0.1, 10);
+    expect(acct.json.balances.eth.available).toBeCloseTo(USERS.startEth + 0.05, 10);
     expect(acct.json.trades.length).toBeGreaterThan(0);
     expect(acct.json.trades[0]).toMatchObject({ side: "buy", role: "taker" });
     const saved = sqlite.query("SELECT status, filled FROM cefi_order").all();
-    expect(saved).toEqual([{ status: "filled", filled: 1000 }]);
+    expect(saved).toEqual([{ status: "filled", filled: 500 }]);
   });
 
   test("cancel all", async () => {

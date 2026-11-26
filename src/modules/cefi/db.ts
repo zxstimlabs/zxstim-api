@@ -21,7 +21,7 @@ export function openCefiDb(path: string) {
   sqlite.exec("PRAGMA foreign_keys = ON;");
   // Balances and the order book: fsync every commit, so a power cut or kernel
   // crash can't drop the last ones (WAL's default, NORMAL, can). Measured at
-  // tens of µs per market write locally; far inside the bot's 500 ms step.
+  // tens of µs per market write locally; far inside the bot's 5 s step.
   sqlite.exec("PRAGMA synchronous = FULL;");
   const db = drizzle(sqlite);
   migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });

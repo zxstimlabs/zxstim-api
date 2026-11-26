@@ -128,7 +128,8 @@ check "$(code "$cb/market/ETH-VND")" 200 "GET /market/ETH-VND"
 # The snapshot's updatedAt only moves when the book changed: a moving value
 # means the bot is trading. Values aren't printed (public log).
 market_at() { curl -s -m 10 "$cb/market/ETH-VND" | sed -n 's/.*"updatedAt":\([0-9]*\).*/\1/p'; }
-bot_active() { local a b; a=$(market_at); sleep 2; b=$(market_at); [ "${b:-0}" -gt "${a:-0}" ] 2>/dev/null; }
+# The bot steps every 5 s (BOT.intervalMs): watch for up to 12 s.
+bot_active() { local a b; a=$(market_at); for _ in $(seq 1 12); do sleep 1; b=$(market_at); [ "${b:-0}" -gt "${a:-0}" ] 2>/dev/null && return 0; done; return 1; }
 curl -s -m 10 "$cb/market/ETH-VND" | grep -q '"bids":\[{' && pass "the book has resting bids" || fail "the book has no bids"
 bot_active && pass "bot is active (the book keeps changing)" || fail "bot is not active"
 check "$(code "$cb/market/ETH-VND/candles?resolution=1m&limit=10")" 200 "GET /market/ETH-VND/candles"
@@ -138,7 +139,8 @@ check "$(curl -s -m 15 -o /dev/null -w '%{http_code}' -H "Origin: $corigin" -H "
   -H 'Content-Type: application/json' -d '{"side":"buy","type":"market","quantity":"0.01"}' "$cb/me/orders")" 201 "POST /me/orders (market buy)"
 # Balances are in the CeFi DB (not Redis): checked again after the recreate below.
 me_eth() { curl -s -m 10 -H "Cookie: $cookie2" "$cb/me/account" | sed -n 's/.*"eth":{"available":\([0-9.]*\).*/\1/p'; }
-[ "$(me_eth)" = 1.01 ] && pass "the buy settled (ETH balance 1 → 1.01)" || fail "the buy did not settle"
+# Accounts start with 5,000,000 VND and no ETH; 0.01 ETH costs about 500,000 VND.
+[ "$(me_eth)" = 0.01 ] && pass "the buy settled (ETH balance 0 → 0.01)" || fail "the buy did not settle"
 
 echo "== DB survives a container recreate (named volume)"
 # Wait for the indexer to start backfilling (it saves its cursor per chunk),
@@ -170,7 +172,7 @@ else
   bot_active && pass "bot active again after recreate" || fail "bot not active after recreate"
   [ -n "$canon" ] && [ "$(session_user "$cookie")" = "$canon" ] && pass "CeFi session survives the app recreate" || fail "CeFi session lost on app recreate"
   check "$(cpost /auth/sign-in/username "{\"username\":\"$acct2\",\"password\":\"246802\"}" 192.0.2.17)" 200 "CeFi accounts DB survives the app recreate (PIN sign-in)"
-  [ "$(me_eth)" = 1.01 ] && pass "CeFi balances survive the app recreate (CeFi DB)" || fail "CeFi balance lost on app recreate"
+  [ "$(me_eth)" = 0.01 ] && pass "CeFi balances survive the app recreate (CeFi DB)" || fail "CeFi balance lost on app recreate"
 fi
 
 echo "== a Redis restart: the market doesn't depend on it, sessions come back"

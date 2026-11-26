@@ -19,7 +19,7 @@ export const BOT = {
   maxLevels: 10, // price levels kept per side
   ethMin: 0.1, // order size range, ETH (on a 0.01 ETH grid)
   ethMax: 2.0,
-  intervalMs: 500, // one bot step per interval
+  intervalMs: 5_000, // one bot step per interval (fewer trades and rows to store)
 } as const;
 
 // --- CeFi users trading on the same book (src/modules/orderbook/market.ts) ---
@@ -34,9 +34,10 @@ export const QUOTE_UNITS_PER_VND = VND_TICKS * ETH_LOTS; // 10^6
 export const USER_ORDER_PREFIX = "u";
 
 export const USERS = {
-  // Every account starts with this, created on its first order.
-  startVnd: 50_000_000,
-  startEth: 1,
+  // Every account starts with this, created on its first order: VND only, so
+  // users buy ETH before they can sell any.
+  startVnd: 5_000_000,
+  startEth: 0,
   minEth: 0.001, // order size bounds, ETH (4 dp, the lot size)
   maxEth: 100,
   // Limit prices are whole VND, within this fraction of the reference price
