@@ -22,7 +22,7 @@ HOT_MANAGER_WALLET_PRIVATE_KEY=0x<YOUR_PRIVATE_KEY>
 ```
 
 - The hot manager wallet's address is derived from the key; there is no separate address variable.
-- Optional: `BACKFILL_RPC_URL` (indexer backfill/poll endpoint, defaults to the public Arbitrum Sepolia RPC), `HOST` / `PORT` (default `127.0.0.1:8001`; the container image sets `0.0.0.0:8000`).
+- Optional: `BACKFILL_RPC_URL` (indexer backfill/poll endpoint, defaults to the public Arbitrum Sepolia RPC), `HOST` / `PORT` (default `127.0.0.1:8001`; the container image sets `0.0.0.0:8000`), `REDIS_URL` (enables the ETH/VND order-book bot; without it the bot is off).
 - On startup the server applies any pending migrations from `./drizzle` (relative to the working directory). Generate migrations locally with `bun db:generate` and commit them; nothing generates migrations on the server.
 
 ## Deployment
@@ -31,32 +31,44 @@ Production runs on the **zxstim-rpc** server (Hetzner, Tailscale machine `zxstim
 
 | Event | Jobs | Target |
 |---|---|---|
-| PR into `main` / `develop` | build image → boot test | — |
-| push `develop` | build → boot test → push → deploy → **smoke test on the server → tear down** | GitHub env **develop** → stack `zxstim-api-dev` on `127.0.0.1:8004`. Throwaway: removed with its DB volume and `.env` |
-| push `main` | build → boot test → push → deploy | GitHub env **production** → stack `zxstim-api` on `127.0.0.1:8003` (nginx: `api.zxstim.com`) |
+| PR into `main` / `develop` | test → build image → boot test | — |
+| push `develop` | test → build → boot test → push → deploy → **smoke test on the server → tear down** | GitHub env **develop** → stack `zxstim-api-dev` on `127.0.0.1:8004`. Throwaway: removed with its volumes and `.env` |
+| push `main` | test → build → boot test → push → deploy | GitHub env **production** → stack `zxstim-api` on `127.0.0.1:8003` (nginx: `api.zxstim.com`) |
 
 Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api prod, `8004` zxstim-api develop.
 
 - **Image:** `ghcr.io/zxstimlabs/zxstim-api:<commit-sha>` (+ `:<branch>`), the `Dockerfile` `runtime` target: the compiled binary plus `drizzle/` on distroless, as nonroot. It contains no secrets.
+- **Tests** (every run): `bun test` (engine, bot, persistence) with a throwaway Redis service, so the Redis store's Lua script is exercised too.
 - **Boot test** (every run, PRs too): runs the built image read-only with a random throwaway key and unreachable upstreams, and checks `/health`, that migrations created the tables (`/pools/<id>` → 503, not 500), 404/candles/WebSocket routes, and nonroot. Only an image that passed is pushed.
 - **Secrets** (`ARBITRUM_SEPOLIA_RPC_URL`, `HOT_MANAGER_WALLET_PRIVATE_KEY`) live in the GitHub environment and reach the server only at deploy time, as `/opt/<stack>/.env` (mode 600).
-- **Data:** SQLite at `/data/sqlite.db` on the named volume `<stack>_data`. Deploys, restarts and `up` keep it. Never run `docker compose down -v` on production.
+- **Data:** SQLite at `/data/sqlite.db` on the named volume `<stack>_data`, and the order book in the stack's own Redis (append-only file on `<stack>_redis-data`; not shared with eth-rpc's Redis). Deploys, restarts and `up` keep both. Never run `docker compose down -v` on production.
 - **Access:** the runner joins Tailscale with a per-environment OIDC credential as `tag:ci`, which may only SSH to `tag:server` as user `deploy`. The server has no public SSH.
 - **On the server:** `deploy/deploy.sh` (same script as eth-rpc's) swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
-- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); the DB survives a container recreate (the indexer resumes from its saved cursor).
-- **Shared box:** the container is capped at 1 CPU / 512 MB so a flood on this API can't starve the RPC proxy.
+- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); the order-book bot is saving to Redis (AOF on); the DB and the book survive an app recreate (indexer resumes from its cursor, book restored), and the book survives a Redis restart.
+- **Shared box:** the app is capped at 1 CPU / 512 MB and its Redis at 0.5 CPU / 256 MB, so a flood on this API can't starve the RPC proxy.
 - **Rollback by hand:** re-run the workflow for an earlier commit, or on the server: `IMAGE=<old ref> HOST_PORT=8003 docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml up -d`.
 - **Logs:** on the server, `docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml logs app`. Workflow logs are public (public repo): nothing in the pipeline prints secrets or the deployed container's logs.
 
 ### One-time setup
 
-- **GitHub:** environments `production` (branch `main` only) and `develop` (branch `develop` only), each with secrets `ARBITRUM_SEPOLIA_RPC_URL` and `HOT_MANAGER_WALLET_PRIVATE_KEY`, and variables `TS_CLIENT_ID` / `TS_AUDIENCE` from a Tailscale OIDC federated credential (tag `tag:ci`, issuer GitHub Actions, subject `repo:zxstimlabs/zxstim-api:environment:<env>`).
+- **GitHub:** environments `production` (branch `main` only) and `develop` (branch `develop` only), each with secrets `ARBITRUM_SEPOLIA_RPC_URL` and `HOT_MANAGER_WALLET_PRIVATE_KEY`, and variables `TS_CLIENT_ID` / `TS_AUDIENCE` from a Tailscale OIDC federated credential (tag `tag:ci`, issuer GitHub Actions, subject `repo:zxstimlabs@161289539/zxstim-api@1250901918:environment:<env>`; the repo uses GitHub's immutable OIDC subject format, like eth-rpc).
 - **Server** (as root): `install -d -o deploy -g deploy -m 750 /opt/zxstim-api /opt/zxstim-api-dev`.
 - **nginx + TLS:** `deploy/nginx.conf` → `/etc/nginx/sites-available/zxstim-api`, symlinked into `sites-enabled`. Its header lists the certbot steps.
 
 ### The database and the indexer backfill
 
 Everything in the DB is derived from chain data, so it isn't backed up. But a **fresh DB starts a full backfill** from block 271232501: tens of millions of blocks, in 5000-block `eth_getLogs` chunks, which takes tens of minutes, and `/pools` returns 503 until it finishes. To move or rebuild production without that gap, seed the volume with a copy of an existing DB: stop the app, put a consistent copy (`sqlite3 <db> ".backup <copy>"`) at `/data/sqlite.db` in the volume, owned by uid 65532, and start it again. It resumes from the saved cursor.
+
+## ETH/VND order book (matching engine + bot)
+
+A price-time-priority limit order book for one market, **ETH/VND**, kept alive by a background bot and persisted in Redis. **No HTTP routes yet**: it runs inside the server process, library-only.
+
+- **Engine:** `src/lib/matching-engine`, imported from [cex-orderbook-matching-engine](https://github.com/zxstimlabs/cex-orderbook-matching-engine). Integers only (`bigint`): quantities in lots (ETH × 10,000), prices in ticks (VND × 100). Limit, market, IOC, FOK and post-only orders; cancel; amend. Design decisions and invariants: [its README](src/lib/matching-engine/README.md).
+- **Bot:** `src/modules/orderbook/bot.ts`, ported from the engine repo's `scripts/test.script.ts`. Every 500 ms it random-walks the mid (45M–55M VND, 50,000 VND levels) and submits a passive limit, a market/IOC taker, a cancel or an amend, keeping at most 10 price levels per side. Parameters: `src/config/orderbook.ts`.
+- **Persistence:** after each step, one atomic Lua call saves the orders that changed to `orderbook:ETH-VND:orders` (hash) and the engine sequence plus bot state to `orderbook:ETH-VND:meta`. On boot the book is restored (`MatchingEngine.restore`), so it carries on across deploys. If Redis is unreachable at boot the bot waits rather than seeding over saved state; if a save fails it keeps running in memory and fully re-syncs once Redis is back; if the saved state is invalid it stays stopped and logs which keys to inspect.
+- **Off without `REDIS_URL`** (local dev, the CI boot test). To run it locally: `redis-server` then `REDIS_URL=redis://localhost:6379 bun run dev`.
+- **Reset the book** (on the server): `docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml exec redis redis-cli DEL orderbook:ETH-VND:orders orderbook:ETH-VND:meta`, then restart the app; it seeds a fresh book.
+- **Logs** only state changes (`[orderbook ETH-VND] seeded / restored / Redis save failed / Redis is back`), never per step.
 
 ## Pools WebSocket Integration
 

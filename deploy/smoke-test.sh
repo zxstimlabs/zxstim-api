@@ -5,13 +5,14 @@
 #
 #   smoke-test.sh <stack> <host-port>
 #
-# For the throwaway "develop" stack only: it recreates the app container, so
-# never point it at production.
+# For the throwaway "develop" stack only: it recreates the app container and
+# restarts Redis, so never point it at production.
 #
 # A fresh develop DB starts a full indexer backfill (tens of minutes), so pool
 # state may still be 503 here. The test checks that the schema exists, the
-# routes answer, the RPC secret reaches the right chain, and the DB survives a
-# container recreate — not that the backfill has finished.
+# routes answer, the RPC secret reaches the right chain, the ETH/VND order-book
+# bot runs and saves to Redis, and both the DB and the book survive a recreate
+# (and the book a Redis restart) — not that the backfill has finished.
 #
 # Output goes to the public workflow log, so it prints only status codes,
 # chain ids and pass/fail lines — never URLs, response bodies, or container
@@ -70,6 +71,16 @@ got=$(curl -s -m 20 -H 'content-type: application/json' \
   | sed -n 's/.*"result":"\(0x[0-9a-fA-F]*\)".*/\1/p')
 check "${got:-none}" 0x66eee "eth_chainId"
 
+echo "== ETH/VND order-book bot, persisted in this stack's Redis"
+book=orderbook:ETH-VND
+redis() { compose exec -T redis redis-cli "$@" 2>/dev/null; }
+seq_now() { redis hget "$book:meta" sequence; }
+n=0; for _ in $(seq 1 20); do n=$(redis hlen "$book:orders"); [ "${n:-0}" -gt 0 ] 2>/dev/null && break; sleep 1; done
+[ "${n:-0}" -gt 0 ] 2>/dev/null && pass "book has $n resting orders in Redis" || fail "no resting orders in Redis"
+s1=$(seq_now); sleep 3; s2=$(seq_now)
+[ "${s2:-0}" -gt "${s1:-0}" ] 2>/dev/null && pass "bot is active (sequence $s1 → $s2)" || fail "sequence did not advance ($s1 → $s2)"
+check "$(redis config get appendonly | sed -n 2p)" yes "Redis append-only persistence on"
+
 echo "== DB survives a container recreate (named volume)"
 # Wait for the indexer to start backfilling (it saves its cursor per chunk),
 # then replace the container. A persisted DB resumes from the saved cursor.
@@ -78,7 +89,7 @@ if [ -z "$started" ]; then
   fail "indexer never started its backfill within 30s"
 else
   sleep 5
-  compose up -d --no-build --force-recreate app >/dev/null 2>&1
+  compose up -d --no-build --no-deps --force-recreate app >/dev/null 2>&1
   if wait_healthy; then pass "healthy again after recreate"; else fail "not healthy within 30s of recreate"; fi
   resumed=""; for _ in $(seq 1 30); do
     log_has "resuming from saved cursor" && { resumed=1; break; }
@@ -86,7 +97,30 @@ else
     sleep 1
   done
   [ -n "$resumed" ] && pass "indexer resumed from its saved cursor" || fail "indexer did not resume from a saved cursor (DB not persisted?)"
+  restored=""; for i in $(seq 1 20); do
+    log_has "[orderbook ETH-VND] restored" && { restored=$i; break; }
+    log_has "[orderbook ETH-VND] no saved book" && break
+    log_has "[orderbook ETH-VND] saved book is invalid" && break
+    sleep 1
+  done
+  [ -n "$restored" ] && pass "order book restored from Redis after recreate (seen within ~${restored}s)" || fail "order book was not restored after recreate"
+  # The bot's own fixed-format lines (counts, sequence, Redis error text; no
+  # secrets) so a slow or failed boot is diagnosable from the public log.
+  compose logs --no-color --no-log-prefix app 2>/dev/null | grep -F '[orderbook ETH-VND]' | cut -c1-200 | sed 's/^/    log: /'
+  s3=$(seq_now); sleep 2
+  [ "$(seq_now)" -gt "${s3:-0}" ] 2>/dev/null && pass "bot active again after recreate" || fail "bot not active after recreate"
 fi
+
+echo "== order book survives a Redis restart (append-only file)"
+before=$(seq_now)
+compose restart redis >/dev/null 2>&1
+up=""; for _ in $(seq 1 20); do [ "$(redis ping)" = PONG ] && { up=1; break; }; sleep 1; done
+[ -n "$up" ] || fail "Redis did not come back within 20s"
+after=$(seq_now)
+[ "${after:-0}" -ge "${before:-1}" ] 2>/dev/null && [ "$(redis hlen "$book:orders")" -gt 0 ] 2>/dev/null \
+  && pass "book still in Redis after its restart (sequence $before → $after)" || fail "book lost on Redis restart ($before → $after)"
+sleep 3
+[ "$(seq_now)" -gt "${after:-0}" ] 2>/dev/null && pass "bot reconnected and kept saving" || fail "bot stopped saving after the Redis restart"
 
 echo
 if [ $fails -eq 0 ]; then echo "smoke-test: all checks passed"; else echo "smoke-test: $fails check(s) FAILED"; fi

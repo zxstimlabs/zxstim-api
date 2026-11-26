@@ -6,6 +6,7 @@ import { delegate } from "./modules/delegate";
 import { sponsor } from "./modules/sponsor";
 import { claim } from "./modules/claim";
 import { sqlite } from "./lib/db";
+import { startOrderbookBot } from "./modules/orderbook";
 
 // Local dev: 127.0.0.1:8001. The container image sets HOST=0.0.0.0 and
 // PORT=8000, and compose publishes that on the host's 127.0.0.1 only.
@@ -40,3 +41,9 @@ const app = new Elysia()
 console.log(
   `🦊 Elysia is running at http://${app.server?.hostname}:${app.server?.port}`
 );
+
+// ETH/VND order-book bot (Redis-backed, no routes). Runs in the background and
+// never blocks or fails the HTTP server; disabled without REDIS_URL.
+void startOrderbookBot().catch((err) => {
+  console.error("[orderbook] failed to start:", err);
+});
