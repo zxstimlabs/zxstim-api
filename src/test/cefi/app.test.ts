@@ -141,6 +141,7 @@ describe("CeFi accounts and sessions", () => {
   });
 
   test("CORS: credentialed for CeFi origins only", async () => {
+    expect(CEFI.origins).toContain("https://www.cefi.vn"); // where the web app is served
     const { app } = setup();
     const preflight = (origin: string) =>
       app.handle(new Request(`${CEFI.baseURL}/auth/sign-in/username`, {

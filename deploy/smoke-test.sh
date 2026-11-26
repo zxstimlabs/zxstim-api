@@ -80,7 +80,7 @@ check "$(redis config get appendonly | sed -n 2p)" yes "Redis append-only persis
 echo "== CeFi API (api.cefi.vn): accounts, PIN sign-in, lockout, CORS"
 cport=$(sed -n 's/^CEFI_HOST_PORT=//p' "$dir/.env")
 cb=http://127.0.0.1:${cport:-0}
-corigin=https://cefi.vn
+corigin=https://www.cefi.vn # where the web app is served
 hdr=$(mktemp)
 # POST JSON to the CeFi API: cpost <path> <json> <client-ip> [origin] → status code.
 # Response headers land in $hdr, the body in $hdr.body.
@@ -114,6 +114,7 @@ pre() {
     | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}'
 }
 check "$(pre "$corigin")" "$corigin" "CORS preflight allows $corigin"
+check "$(pre https://cefi.vn)" https://cefi.vn "CORS preflight allows https://cefi.vn"
 check "$(pre https://evil.example)" "" "CORS preflight allows no other origin"
 [ "$(redis --scan --pattern 'cefi:*' | grep -c .)" -gt 0 ] && pass "auth state is in this stack's Redis (cefi:*)" || fail "no cefi:* keys in Redis"
 # A second account (the first one is now locked) for the CeFi DB persistence

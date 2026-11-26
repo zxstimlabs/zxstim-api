@@ -7,13 +7,15 @@
 
 export const CEFI = {
   // Production web origins. Credentialed CORS and Better Auth's origin checks
-  // allow exactly these (plus CEFI_EXTRA_ORIGINS for local dev).
-  origins: ["https://cefi.vn", "https://sim.cefi.vn"],
+  // (passkeys included) allow exactly these (plus CEFI_EXTRA_ORIGINS for local
+  // dev). The web app is served at www.cefi.vn (Vercel); the apex and the old
+  // sim.cefi.vn stay allowed.
+  origins: ["https://www.cefi.vn", "https://cefi.vn", "https://sim.cefi.vn"],
   // Public URL of this API. Cookies are set for this host (same site as the
   // origins above, so SameSite=Lax cookies work without third-party cookies).
   baseURL: "https://api.cefi.vn",
   // Passkeys are bound to this domain: one passkey works on cefi.vn and every
-  // subdomain (sim.cefi.vn today, cefi.vn after the move).
+  // subdomain (www.cefi.vn, sim.cefi.vn).
   rpID: "cefi.vn",
   rpName: "CeFi Simulator",
 
