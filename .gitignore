@@ -39,10 +39,8 @@ yarn-error.log*
 package-lock.json
 **/*.bun
 
-# db
-sqlite.db
-sqlite.db-shm
-sqlite.db-wal
-cefi.db
-cefi.db-shm
-cefi.db-wal
+# db: data/defi/defi.db and data/cefi/cefi.db (plus -shm/-wal)
+/data/
+# pre-rename locations
+sqlite.db*
+cefi.db*

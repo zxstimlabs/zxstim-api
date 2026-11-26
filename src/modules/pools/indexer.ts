@@ -434,7 +434,7 @@ export abstract class PoolIndexer {
     if (isFresh) {
       console.warn(
         `[pools-indexer] no saved cursor — running a FULL backfill from deploy block ${POOL_DEPLOY_BLOCK}. ` +
-          `If you see this on EVERY restart, the DB at DATABASE_PATH is not persisting ` +
+          `If you see this on EVERY restart, the DB at DEFI_DATABASE_PATH is not persisting ` +
           `(check that the path is absolute and on a durable volume).`
       );
     } else {

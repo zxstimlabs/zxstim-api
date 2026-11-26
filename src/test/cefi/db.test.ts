@@ -3,6 +3,9 @@
 
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openCefiDb } from "../../modules/cefi/db";
@@ -22,9 +25,22 @@ describe("separate databases", () => {
 
   test("the DeFi migrations create no CeFi tables", () => {
     const sqlite = new Database(":memory:");
-    migrate(drizzle(sqlite), { migrationsFolder: "./drizzle" });
+    migrate(drizzle(sqlite), { migrationsFolder: "./drizzle/defi" });
     const names = tables(sqlite);
     expect(names).toContain("swaps");
     expect(names.filter((n) => n.startsWith("cefi_"))).toEqual([]);
+  });
+
+  test("opening a DB at data/<name>/<name>.db creates the folder", () => {
+    const dir = mkdtempSync(join(tmpdir(), "zxstim-db-"));
+    try {
+      const path = join(dir, "data", "cefi", "cefi.db");
+      const { sqlite } = openCefiDb(path);
+      expect(sqlite.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+      sqlite.close();
+      expect(existsSync(path)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
