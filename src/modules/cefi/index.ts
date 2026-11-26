@@ -19,11 +19,21 @@ import { CEFI_DEFAULT_DATABASE_PATH, openCefiDb } from "./db";
 import { createCefiApp } from "./app";
 import { createCefiAuth } from "./auth";
 import { RedisStorage } from "./storage";
+import type { MarketHandle } from "../orderbook";
+import { SqliteMarketDb } from "../orderbook/market-db";
 
-export function startCefi(hostname: string): void {
+// What the rest of the process needs from a running CeFi API: the market
+// tables in its DB (for the order-book runner), and where to plug the market in.
+export interface CefiHandle {
+  marketDb: SqliteMarketDb;
+  useMarket(market: MarketHandle): void;
+}
+
+// Returns null when CEFI_ENABLED isn't set.
+export function startCefi(hostname: string): CefiHandle | null {
   if (process.env.CEFI_ENABLED !== "1") {
-    console.log("[cefi] CEFI_ENABLED not set; CeFi API disabled");
-    return;
+    console.log("[cefi] CEFI_ENABLED not set; CeFi API and the ETH/VND market disabled");
+    return null;
   }
 
   const secret = process.env.BETTER_AUTH_SECRET ?? "";
@@ -54,10 +64,12 @@ export function startCefi(hostname: string): void {
     rpID: process.env.CEFI_RP_ID ?? CEFI.rpID,
     origins,
   });
+  let market: MarketHandle | null = null;
   const app = createCefiApp({
     auth,
     storage,
     origins,
+    market: () => market?.current() ?? null,
     healthy: async () => {
       sqlite.query("SELECT 1").get();
       await storage.get("health");
@@ -66,4 +78,10 @@ export function startCefi(hostname: string): void {
   }).listen({ hostname, port });
 
   console.log(`[cefi] CeFi API on http://${app.server?.hostname}:${app.server?.port}`);
+  return {
+    marketDb: new SqliteMarketDb(sqlite),
+    useMarket: (m) => {
+      market = m;
+    },
+  };
 }

@@ -19,8 +19,22 @@ const tables = (sqlite: Database) =>
 describe("separate databases", () => {
   test("the CeFi DB holds only CeFi tables", () => {
     const { sqlite } = openCefiDb(":memory:");
-    expect(tables(sqlite)).toEqual(["__drizzle_migrations", "cefi_account", "cefi_passkey", "cefi_session", "cefi_user"]);
+    expect(tables(sqlite)).toEqual([
+      "__drizzle_migrations",
+      "cefi_account",
+      "cefi_balance",
+      "cefi_book_order",
+      "cefi_book_state",
+      "cefi_candle",
+      "cefi_fill",
+      "cefi_order",
+      "cefi_passkey",
+      "cefi_session",
+      "cefi_trade",
+      "cefi_user",
+    ]);
     expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+    expect(sqlite.query("PRAGMA synchronous").get()).toEqual({ synchronous: 2 }); // FULL: every commit fsynced
   });
 
   test("the DeFi migrations create no CeFi tables", () => {

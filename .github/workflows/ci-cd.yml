@@ -45,7 +45,7 @@ jobs:
     name: Test
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # Throwaway Redis for the order-book store test (src/test/orderbook).
+    # Throwaway Redis for the CeFi Redis storage test (src/test/cefi).
     services:
       redis:
         image: redis:8-alpine

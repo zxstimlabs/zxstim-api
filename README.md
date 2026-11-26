@@ -21,7 +21,7 @@ HOT_MANAGER_WALLET_PRIVATE_KEY=0x<YOUR_PRIVATE_KEY>
 ```
 
 - The hot manager wallet's address is derived from the key; there is no separate address variable.
-- Optional: `DEFI_DATABASE_PATH` (default `./data/defi/defi.db`), `BACKFILL_RPC_URL` (indexer backfill/poll endpoint, defaults to the public Arbitrum Sepolia RPC), `HOST` / `PORT` (default `127.0.0.1:8001`; the container image sets `0.0.0.0:8000`), `REDIS_URL` (enables the ETH/VND order-book bot; without it the bot is off).
+- Optional: `DEFI_DATABASE_PATH` (default `./data/defi/defi.db`), `BACKFILL_RPC_URL` (indexer backfill/poll endpoint, defaults to the public Arbitrum Sepolia RPC), `HOST` / `PORT` (default `127.0.0.1:8001`; the container image sets `0.0.0.0:8000`), `REDIS_URL` (the CeFi API's sessions cache, rate limits and PIN lockouts; required with `CEFI_ENABLED=1`).
 - **Databases:** two SQLite files with one layout, `data/<name>/<name>.db` with migrations in `drizzle/<name>/`: the DeFi indexer DB (`data/defi/defi.db`, `drizzle/defi/`) and the CeFi accounts DB (`data/cefi/cefi.db`, `drizzle/cefi/`). Paths are relative to the working directory (`/app` in the image, whose DBs are at `/data/defi/defi.db` and `/data/cefi/cefi.db`); `data/` is gitignored and its folders are created on first start.
 - On startup the server applies any pending migrations. Generate them locally with `bun db:generate:defi` / `bun db:generate:cefi` and commit them; nothing generates migrations on the server.
 
@@ -38,7 +38,7 @@ Production runs on the **zxstim-rpc** server (Hetzner, Tailscale machine `zxstim
 Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api prod, `8004` zxstim-api develop, `8005` CeFi API prod (nginx: `api.cefi.vn`), `8006` CeFi API develop.
 
 - **Image:** `ghcr.io/zxstimlabs/zxstim-api:<commit-sha>` (+ `:<branch>`), the `Dockerfile` `runtime` target: the compiled binary plus `drizzle/` (both DBs' migrations) on distroless, as nonroot. It contains no secrets.
-- **Tests** (every run): `bun test` (engine, bot, persistence) with a throwaway Redis service, so the Redis store's Lua script is exercised too.
+- **Tests** (every run): `bun test` (engine, bot, market and its SQLite persistence, CeFi API) with a throwaway Redis service, so the CeFi Redis storage is exercised too.
 - **Boot test** (every run, PRs too): runs the built image read-only with a random throwaway key and unreachable upstreams, and checks `/health`, that migrations created the tables (`/pools/<id>` → 503, not 500), 404/candles/WebSocket routes, and nonroot. Only an image that passed is pushed.
 - **Secrets** (`ARBITRUM_SEPOLIA_RPC_URL`, `HOT_MANAGER_WALLET_PRIVATE_KEY`, `BETTER_AUTH_SECRET`, `CEFI_PIN_PEPPER`) live in the GitHub environment and reach the server only at deploy time, as `/opt/<stack>/.env` (mode 600).
 - **Data:** two separate SQLite files, each on its own volume, plus the stack's own Redis (not shared with eth-rpc's):
@@ -46,13 +46,13 @@ Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api
   | Store | Volume | Holds | If lost |
   |---|---|---|---|
   | `/data/defi/defi.db` | `<stack>_defi-data` | DeFi indexer (pool meta, swaps, states, cursor); migrations `drizzle/defi/` | Rebuilt from chain (a long backfill) |
-  | `/data/cefi/cefi.db` | `<stack>_cefi-data` | CeFi accounts, PIN hashes, sessions, passkeys; migrations `drizzle/cefi/` | **Accounts gone: back it up** |
-  | Redis (append-only file) | `<stack>_redis-data` | Order book, CeFi session cache, rate limits, PIN lockouts | Book reseeds; users sign in again |
+  | `/data/cefi/cefi.db` | `<stack>_cefi-data` | CeFi accounts, PIN hashes, sessions, passkeys; the ETH/VND order book; users' balances, orders and fills; the trade log (30 days) and candles; migrations `drizzle/cefi/` | **Accounts and balances gone: back it up** |
+  | Redis (append-only file) | `<stack>_redis-data` | CeFi session cache, rate limits, PIN lockouts | Users sign in again |
 
   Deploys, restarts and `up` keep all three. Never run `docker compose down -v` on production.
 - **Access:** the runner joins Tailscale with a per-environment OIDC credential as `tag:ci`, which may only SSH to `tag:server` as user `deploy`. The server has no public SSH.
 - **On the server:** `deploy/deploy.sh` (same script as eth-rpc's) swaps in the new `.env`, pulls, restarts, checks `/health` for 30s, and **rolls back** to the previous image and `.env` if unhealthy.
-- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); the order-book bot is saving to Redis (AOF on); the CeFi API creates an account, signs in with the PIN, locks after 5 wrong PINs, hides the raw sign-up route, and allows only the CeFi origins; the DB, the book and a CeFi session survive an app recreate, and the book survives a Redis restart.
+- **develop smoke test** (`deploy/smoke-test.sh`, refuses non-dev stacks): `/health`; pool routes answer (503 is fine while the backfill runs); WebSocket upgrade; CORS preflight; `/rpc/arbitrum-sepolia` returns chain `0x66eee` (validates the RPC secret); Redis has AOF on; the CeFi API creates an account, signs in with the PIN, locks after 5 wrong PINs, hides the raw sign-up route, and allows only the CeFi origins; the ETH/VND market answers, the bot trades, and a signed-in market buy settles; the DBs, the book, the balance and a CeFi session survive an app recreate, and the market keeps trading through a Redis restart.
 - **Shared box:** the app is capped at 1 CPU / 512 MB and its Redis at 0.5 CPU / 256 MB, so a flood on this API can't starve the RPC proxy.
 - **Rollback by hand:** re-run the workflow for an earlier commit, or on the server: `IMAGE=<old ref> HOST_PORT=8003 docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml up -d`.
 - **Logs:** on the server, `docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml logs app`. Workflow logs are public (public repo): nothing in the pipeline prints secrets or the deployed container's logs.
@@ -68,18 +68,22 @@ Ports on the box: `8001` eth-rpc prod, `8002` eth-rpc develop, `8003` zxstim-api
 
 Everything in the **DeFi** DB is derived from chain data, so it isn't backed up. But a **fresh DeFi DB starts a full backfill** from block 271232501: tens of millions of blocks, in 5000-block `eth_getLogs` chunks, which takes tens of minutes, and `/pools` returns 503 until it finishes. To move or rebuild production without that gap, seed the volume with a copy of an existing DB: stop the app, put a consistent copy (`sqlite3 <db> ".backup <copy>"`) at `defi.db` in the `<stack>_defi-data` volume, owned by uid 65532, and start it again. It resumes from the saved cursor.
 
-The **CeFi** DB is the opposite: it holds accounts that can't be recreated. **It is not backed up yet.** Options: Hetzner's server backups (whole box, daily), or a scheduled `sqlite3 <volume>/cefi.db ".backup …"` of the `<stack>_cefi-data` volume, copied off the box. Sessions are also cached in Redis, but accounts and PIN hashes exist only in this file.
+The **CeFi** DB is the opposite: it holds accounts and their simulated balances and order history, which can't be recreated. **It is not backed up yet.** Options: Hetzner's server backups (whole box, daily), or a scheduled `sqlite3 <volume>/cefi.db ".backup …"` of the `<stack>_cefi-data` volume, copied off the box. Sessions are also cached in Redis, but accounts and PIN hashes exist only in this file.
 
 ## ETH/VND order book (matching engine + bot)
 
-A price-time-priority limit order book for one market, **ETH/VND**, kept alive by a background bot and persisted in Redis. **No HTTP routes yet**: it runs inside the server process, library-only.
+A price-time-priority limit order book for one market, **ETH/VND**, kept alive by a background bot. CeFi users trade on the same book through the CeFi API (below); the routes are on that listener only, and the market runs only with it (`CEFI_ENABLED=1`).
 
 - **Engine:** `src/lib/matching-engine`, imported from [cex-orderbook-matching-engine](https://github.com/zxstimlabs/cex-orderbook-matching-engine). Integers only (`bigint`): quantities in lots (ETH × 10,000), prices in ticks (VND × 100). Limit, market, IOC, FOK and post-only orders; cancel; amend. Design decisions and invariants: [its README](src/lib/matching-engine/README.md).
 - **Bot:** `src/modules/orderbook/bot.ts`, ported from the engine repo's `scripts/test.script.ts`. Every 500 ms it random-walks the mid (45M–55M VND, 50,000 VND levels) and submits a passive limit, a market/IOC taker, a cancel or an amend, keeping at most 10 price levels per side. Parameters: `src/config/orderbook.ts`.
-- **Persistence:** after each step, one atomic Lua call saves the orders that changed to `orderbook:ETH-VND:orders` (hash) and the engine sequence plus bot state to `orderbook:ETH-VND:meta`. On boot the book is restored (`MatchingEngine.restore`), so it carries on across deploys. If Redis is unreachable at boot the bot waits rather than seeding over saved state; if a save fails it keeps running in memory and fully re-syncs once Redis is back; if the saved state is invalid it stays stopped and logs which keys to inspect.
-- **Off without `REDIS_URL`** (local dev, the CI boot test). To run it locally: `redis-server` then `REDIS_URL=redis://localhost:6379 bun run dev`.
-- **Reset the book** (on the server): `docker compose -p zxstim-api -f /opt/zxstim-api/compose.yaml exec redis redis-cli DEL orderbook:ETH-VND:orders orderbook:ETH-VND:meta`, then restart the app; it seeds a fresh book.
-- **Logs** only state changes (`[orderbook ETH-VND] seeded / restored / Redis save failed / Redis is back`), never per step.
+- **CeFi users** (`src/modules/orderbook/market.ts`): user orders (ids `u<n>`) go into the same engine; the bot never cancels, amends or trims them, it just trades with them. Every trade settles users' simulated balances in the same synchronous call, and feeds the trade log, 1m–1d candles and 24 h ticker. Limit and market orders only, no fees. Each account starts with 50,000,000 VND + 1 ETH (on its first order); a resting limit order locks what it could spend and gives it back as it fills or is cancelled. Bounds (size 0.001–100 ETH, whole-VND prices within ±50% of the last trade, 20 open orders, 120 actions/min): `USERS` in `src/config/orderbook.ts`. Internally integers only: ETH in lots, VND balances in ticks × lots (VND × 10⁶), so fills never round.
+- **Persistence: all in the CeFi DB, one transaction per match.** Matching runs in memory. At the end of every engine call (a bot step's order, a user's order or cancel), what it changed is written to the CeFi SQLite DB in ONE transaction, in the same synchronous step (`bun:sqlite`): the book's changed orders and the engine/bot state (`cefi_book_order`, `cefi_book_state`), users' balances, orders and fills (`cefi_balance`, `cefi_order`, `cefi_fill`), the trade log (`cefi_trade`, every match, bot or user) and candles (`cefi_candle`). Schema `src/modules/cefi/market-schema.ts`, queries `src/modules/orderbook/market-db.ts`. So the saved book and the balances can't disagree, and a placed order is saved before the API answers. The DB runs with `synchronous = FULL` (every commit fsynced); a market write measured tens of µs locally, far inside the bot's 500 ms step.
+- **On boot** the engine is restored from the saved book (`MatchingEngine.restore`), priorities and all, and every open user order must be on it with the same remaining size (and vice versa); otherwise, or if the saved book is invalid, the market stays stopped and logs what's wrong. No saved book (first start, or reset): a fresh one is seeded, its sequence continuing above the trade log's (trade ids are never reused), and users' open orders are put back on it. If a DB write ever fails, the market stops (bot and orders, 503) until a restart.
+- **Retention:** the trade log keeps 30 days and the candles the newest 1,500 per resolution (pruned hourly, `MARKET_DATA` in `src/config/orderbook.ts`); users' fills and orders are kept for good.
+- **Off without the CeFi API** (`CEFI_ENABLED` unset: local dev, the CI boot test). Running it locally: see the CeFi API's local dev line below.
+- **Reset the book:** stop the app, delete the book's rows (`DELETE FROM cefi_book_order; DELETE FROM cefi_book_state;` in the CeFi DB), start it again: it seeds a fresh book and puts users' open orders back on it. Balances, history and the chart are untouched.
+- **Upgrading from the Redis-backed book:** the first start with this version seeds a fresh book in the CeFi DB. The old `orderbook:ETH-VND:orders` and `:meta` keys in Redis are no longer used; delete them when convenient.
+- **Logs** only state changes (`[orderbook ETH-VND] seeded / restored / bot NOT started`, `[market] DB write failed`), never per step.
 
 ## CeFi API (api.cefi.vn): accounts without email
 
@@ -106,7 +110,24 @@ For the CeFi simulator web app (cefi.vn, sim.cefi.vn until the move). Separate f
 
 Every other `/auth/*` path is 404 (`AUTH_PATHS` in `src/modules/cefi/app.ts`), including all email, password-reset and social routes and the raw `/auth/sign-up/email`. The web app can use Better Auth's client (`createAuthClient({ baseURL: "https://api.cefi.vn/auth", plugins: [usernameClient(), passkeyClient()] })`, with `credentials: "include"`) for everything except account creation, which is a plain `fetch` to `/accounts`.
 
-**Local dev:** `redis-server`, then `CEFI_ENABLED=1 CEFI_BASE_URL=http://localhost:8002 CEFI_RP_ID=localhost CEFI_EXTRA_ORIGINS=http://localhost:5173 BETTER_AUTH_SECRET=… CEFI_PIN_PEPPER=… REDIS_URL=redis://localhost:6379 bun run dev` (see `.env.example`).
+### Market routes (ETH/VND)
+
+`src/modules/cefi/market.ts`, on the CeFi listener. Amounts are JSON numbers in human units (VND, ETH); requests may also send them as strings (`"0.05"`), parsed exactly. Errors are `{ error, code }` (codes like `insufficient_balance`, `price_out_of_band`, `no_liquidity`, `invalid_quantity`, `market_unavailable`), so the web app can show its own wording. The GETs send an `ETag` (exposed to CORS) and answer `304` to a matching `If-None-Match`: poll them every second.
+
+| Route | |
+|---|---|
+| `GET /market/ETH-VND` | `{ ticker: { last, open24h, high24h, low24h, change24h, changePct24h, volume24h, quoteVolume24h } \| null, depth: { bids, asks: [{ price, quantity, count }] }, trades: [{ id, price, quantity, side, time }], updatedAt }`. Public. `side` is the taker's. |
+| `GET /market/ETH-VND/candles?resolution=15m&limit=500` | `{ candles: [{ t, open, high, low, close, volume }] }`, oldest first; `t` in unix seconds; resolutions `1m 5m 15m 1h 4h 1d`, limit 1–1000. Public. Fold the snapshot's new `trades` onto the last candle for a live chart. |
+| `GET /me/account` | `{ balances: { vnd, eth: { available, locked } }, openOrders, orderHistory, trades }`: open orders, the last 100 closed orders and fills (orders `{ id, side, type, price, quantity, filled, avgPrice, total, status, createdAt, updatedAt }`). Signed in. |
+| `GET /me/orders?before=<id>&limit=50` | Closed orders, newest first, all of them page by page: `{ orders, next }` (`next` is the `before` for the next page, null at the end). Signed in. |
+| `GET /me/trades?before=<id>&limit=50` | Fills, newest first, the same way: `{ trades, next }`. Signed in. |
+| `POST /me/orders` `{ side, type, price?, quantity }` | `side` `buy`/`sell`, `type` `limit`/`market` (price only for limit). 201 `{ order }`, already settled for whatever filled at once. Signed in, CeFi `Origin`. |
+| `DELETE /me/orders/:id` | Cancel one: `{ order }`. |
+| `DELETE /me/orders` | Cancel all: `{ cancelled }`. |
+
+503 `market_unavailable` if the market failed to load, or after a failed CeFi DB write until a restart. The market doesn't use Redis, but signing in does (sessions, rate limits).
+
+**Local dev:** `redis-server`, then `CEFI_ENABLED=1 CEFI_BASE_URL=http://localhost:8002 CEFI_RP_ID=localhost CEFI_EXTRA_ORIGINS=http://localhost:5800 BETTER_AUTH_SECRET=… CEFI_PIN_PEPPER=… REDIS_URL=redis://localhost:6379 bun run dev` (see `.env.example`; the CeFi web app's dev server is on port 5800).
 
 ## Pools WebSocket Integration
 

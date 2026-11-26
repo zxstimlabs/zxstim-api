@@ -1,31 +1,28 @@
-// The ETH/VND bot and its persistence loop, against the in-memory store.
-// Deterministic: every bot gets a seeded PRNG.
+// The ETH/VND bot, and the runner that keeps its book in the CeFi DB (real
+// SQLite, in memory, with this repo's migrations). Deterministic: every bot
+// gets a seeded PRNG.
 
 import { describe, expect, test } from "bun:test";
 import { MatchingEngine } from "../../lib/matching-engine";
 import { BOT } from "../../config/orderbook";
-import { OrderbookBot, toLevels, toTicks, type BookChanges } from "../../modules/orderbook/bot";
-import { loadRunner } from "../../modules/orderbook";
-import { MemoryBookStore } from "../../modules/orderbook/store";
+import { openCefiDb } from "../../modules/cefi/db";
+import { OrderbookBot, toLevels, toTicks } from "../../modules/orderbook/bot";
+import { loadRunner, type OrderbookRunner } from "../../modules/orderbook";
+import { SqliteMarketDb } from "../../modules/orderbook/market-db";
 import { assertBookInvariants, mulberry32 } from "../matching-engine/helpers";
 
-// The store holds exactly the live book, sequence and bot state.
-async function expectMirrors(store: MemoryBookStore, bot: OrderbookBot): Promise<void> {
-  const saved = await store.load();
-  expect(saved).not.toBeNull();
-  expect(MatchingEngine.restore(saved!).snapshot()).toEqual(bot.engine.snapshot());
-  expect(saved!.sequence).toBe(bot.engine.sequence);
-  expect(saved!.bot).toEqual(bot.state);
-  const { bids, asks } = bot.engine.snapshot();
-  expect(store.orders.size).toBe(bids.length + asks.length);
+function newDb() {
+  const { sqlite } = openCefiDb(":memory:");
+  return { sqlite, db: new SqliteMarketDb(sqlite) };
 }
 
-class FlakyStore extends MemoryBookStore {
-  down = false;
-  override async save(c: BookChanges, opts?: { reset?: boolean }): Promise<void> {
-    if (this.down) throw new Error("store down");
-    return super.save(c, opts);
-  }
+// The DB holds exactly the live book, sequence and bot state.
+function expectMirrors(db: SqliteMarketDb, runner: OrderbookRunner): void {
+  const saved = db.loadBook();
+  expect(saved).not.toBeNull();
+  expect(MatchingEngine.restore(saved!).snapshot()).toEqual(runner.bot.engine.snapshot());
+  expect(saved!.sequence).toBe(runner.bot.engine.sequence);
+  expect(saved!.bot).toEqual(runner.bot.state);
 }
 
 describe("OrderbookBot", () => {
@@ -59,57 +56,47 @@ describe("OrderbookBot", () => {
     expect(bot.engine.sequence).toBeGreaterThan(1000); // it actually trades and rests orders
   });
 
-  test("drainChanges keeps a store in step with the live book", async () => {
-    const store = new MemoryBookStore();
-    const bot = new OrderbookBot(new MatchingEngine(), mulberry32(7));
-    bot.seed();
-    await store.save(bot.fullState(), { reset: true });
+  test("every step leaves the DB holding exactly the live book", () => {
+    const { db } = newDb();
+    const runner = loadRunner(db, mulberry32(7))!;
+    expectMirrors(db, runner);
     for (let i = 1; i <= 1000; i++) {
-      bot.step();
-      await store.save(bot.drainChanges());
-      if (i % 100 === 0) await expectMirrors(store, bot);
+      runner.tick();
+      if (i % 100 === 0) expectMirrors(db, runner);
     }
   });
 });
 
-describe("loadRunner / OrderbookRunner", () => {
-  test("seeds when nothing is saved, and a second runner restores the same book", async () => {
-    const store = new MemoryBookStore();
-    const first = (await loadRunner(store, mulberry32(3)))!;
-    for (let i = 0; i < 300; i++) await first.tick();
-    await expectMirrors(store, first.bot);
+describe("loadRunner", () => {
+  test("seeds when nothing is saved, and a second runner restores the same book", () => {
+    const { db } = newDb();
+    const first = loadRunner(db, mulberry32(3))!;
+    for (let i = 0; i < 300; i++) first.tick();
+    expectMirrors(db, first);
 
-    const second = (await loadRunner(store, mulberry32(4)))!;
+    const second = loadRunner(db, mulberry32(4))!;
     expect(second.bot.engine.snapshot()).toEqual(first.bot.engine.snapshot());
     expect(second.bot.engine.sequence).toBe(first.bot.engine.sequence);
     expect(second.bot.state).toEqual(first.bot.state);
   });
 
-  test("after failed saves, the next good save fully re-syncs the store", async () => {
-    const store = new FlakyStore();
-    const runner = (await loadRunner(store, mulberry32(5)))!;
-    for (let i = 0; i < 20; i++) await runner.tick();
-    store.down = true;
-    for (let i = 0; i < 50; i++) await runner.tick(); // these deltas are lost
-    store.down = false;
-    await runner.tick();
-    await expectMirrors(store, runner.bot);
-  });
+  test("refuses to start on invalid saved state (and leaves it alone)", () => {
+    const garbled = newDb();
+    loadRunner(garbled.db, mulberry32(5))!.tick();
+    garbled.sqlite.run("UPDATE cefi_book_order SET side = 'hold' WHERE rowid = (SELECT min(rowid) FROM cefi_book_order)");
+    expect(loadRunner(garbled.db)).toBeNull();
+    expect(garbled.sqlite.query("SELECT count(*) AS n FROM cefi_book_order WHERE side = 'hold'").get()).toEqual({ n: 1 });
 
-  test("refuses to start on undecodable or invalid saved state (and leaves it alone)", async () => {
-    const garbled = new MemoryBookStore();
-    garbled.meta.set("sequence", "1").set("mid", String(BOT.midStart)).set("idSeq", "1");
-    garbled.orders.set("x", "{not json");
-    expect(await loadRunner(garbled)).toBeNull();
-    expect(garbled.orders.get("x")).toBe("{not json");
+    const crossed = newDb();
+    loadRunner(crossed.db, mulberry32(6))!.tick();
+    crossed.sqlite.run(
+      `UPDATE cefi_book_order SET price = ${toTicks(BOT.midMax * 2)} WHERE side = 'buy' AND rowid = (SELECT min(rowid) FROM cefi_book_order WHERE side = 'buy')`,
+    );
+    expect(loadRunner(crossed.db)).toBeNull();
 
-    const crossed = new MemoryBookStore();
-    const bot = new OrderbookBot(new MatchingEngine(), mulberry32(6));
-    bot.seed();
-    const state = bot.fullState();
-    const [bid] = state.upserts.filter((o) => o.side === "buy");
-    bid!.price = toTicks(BOT.midMax * 2); // above every ask
-    await crossed.save(state, { reset: true });
-    expect(await loadRunner(crossed)).toBeNull();
+    const orphans = newDb();
+    loadRunner(orphans.db, mulberry32(8))!.tick();
+    orphans.sqlite.run("DELETE FROM cefi_book_state");
+    expect(loadRunner(orphans.db)).toBeNull(); // orders without the state row
   });
 });

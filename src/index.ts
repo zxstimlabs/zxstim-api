@@ -43,12 +43,11 @@ console.log(
   `🦊 Elysia is running at http://${app.server?.hostname}:${app.server?.port}`
 );
 
-// ETH/VND order-book bot (Redis-backed, no routes). Runs in the background and
-// never blocks or fails the HTTP server; disabled without REDIS_URL.
-void startOrderbookBot().catch((err) => {
-  console.error("[orderbook] failed to start:", err);
-});
-
 // CeFi API (api.cefi.vn): a second listener with its own CORS and auth. Off
 // unless CEFI_ENABLED=1; when on, it throws here on bad config (fail fast).
-startCefi(HOST);
+const cefi = startCefi(HOST);
+
+// ETH/VND market: the order-book bot plus CeFi users' orders, all in the CeFi
+// DB. Part of the CeFi API (its routes are there), so off without it. A
+// market that fails to load logs why and stays off; it never fails the server.
+if (cefi) cefi.useMarket(startOrderbookBot(cefi.marketDb));

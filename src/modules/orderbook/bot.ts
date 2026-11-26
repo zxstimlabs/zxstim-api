@@ -8,6 +8,11 @@
 // Every engine call goes through submit/cancel/amend below, which record the
 // ids of orders that changed (the order itself and any makers it traded
 // against). drainChanges() turns those into the upserts/deletes to persist.
+//
+// CeFi users trade on the same book (market.ts): their orders go through
+// submitFor/cancelFor, so they are recorded the same way, and every engine
+// call's events go to `listener`. The bot never cancels, amends or trims a
+// user's order (ids starting with USER_ORDER_PREFIX).
 
 import {
   MatchingEngine,
@@ -16,7 +21,7 @@ import {
   type RestingOrder,
   type Side,
 } from "../../lib/matching-engine";
-import { BOT, ETH_LOTS, VND_TICKS } from "../../config/orderbook";
+import { BOT, ETH_LOTS, USER_ORDER_PREFIX, VND_TICKS } from "../../config/orderbook";
 
 export interface BotState {
   mid: number; // VND per ETH, a multiple of BOT.tickVnd
@@ -31,6 +36,12 @@ export interface BookChanges {
   deletes: string[];
   bot: BotState;
 }
+
+// Receives the events of every engine call. `takerSide` is the side of the
+// order that was submitted (undefined for cancels and amends).
+export type EngineListener = (events: Event[], takerSide: Side | undefined) => void;
+
+export const isUserOrderId = (id: string): boolean => id.startsWith(USER_ORDER_PREFIX);
 
 export const toTicks = (vnd: number): bigint => BigInt(vnd) * BigInt(VND_TICKS);
 
@@ -55,6 +66,7 @@ export class OrderbookBot {
   private mid: number;
   private idSeq: number;
   private readonly touched = new Set<string>();
+  listener: EngineListener | null = null;
 
   constructor(
     readonly engine: MatchingEngine,
@@ -86,7 +98,7 @@ export class OrderbookBot {
     this.mid = Math.max(BOT.midMin, Math.min(BOT.midMax, this.mid));
 
     const snap = this.engine.snapshot();
-    const restingIds = [...snap.bids, ...snap.asks].map((o) => o.id);
+    const restingIds = [...snap.bids, ...snap.asks].map((o) => o.id).filter((id) => !isUserOrderId(id));
     const roll = this.rng();
 
     if (roll < 0.58) {
@@ -141,7 +153,7 @@ export class OrderbookBot {
   }
 
   // Keep each side to at most BOT.maxLevels price levels by cancelling the
-  // worst-priced (deepest) levels.
+  // worst-priced (deepest) levels. Users' orders count as levels but stay.
   private trimToDepth(): void {
     for (const side of ["buy", "sell"] as const) {
       const snap = this.engine.snapshot();
@@ -149,27 +161,39 @@ export class OrderbookBot {
       const levels = toLevels(orders); // best-first
       if (levels.length <= BOT.maxLevels) continue;
       const drop = new Set(levels.slice(BOT.maxLevels).map((l) => l.price));
-      for (const o of orders) if (drop.has(o.price)) this.cancel(o.id);
+      for (const o of orders) if (drop.has(o.price) && !isUserOrderId(o.id)) this.cancel(o.id);
     }
+  }
+
+  // --- engine calls for others (CeFi users), recorded like the bot's own ----
+
+  submitFor(order: NewOrder): Event[] {
+    return this.submit(order);
+  }
+
+  cancelFor(id: string): Event[] {
+    return this.cancel(id);
   }
 
   // --- engine calls, recording what changed --------------------------------
 
-  private submit(order: NewOrder): void {
-    this.track(order.id, this.engine.submit(order));
+  private submit(order: NewOrder): Event[] {
+    return this.track(order.id, this.engine.submit(order), order.side);
   }
 
-  private cancel(id: string): void {
-    this.track(id, this.engine.cancel(id));
+  private cancel(id: string): Event[] {
+    return this.track(id, this.engine.cancel(id));
   }
 
-  private amend(id: string, changes: { price?: bigint; quantity?: bigint }): void {
-    this.track(id, this.engine.amend(id, changes));
+  private amend(id: string, changes: { price?: bigint; quantity?: bigint }): Event[] {
+    return this.track(id, this.engine.amend(id, changes));
   }
 
-  private track(id: string, events: Event[]): void {
+  private track(id: string, events: Event[], takerSide?: Side): Event[] {
     this.touched.add(id);
     for (const e of events) if (e.type === "trade") this.touched.add(e.trade.makerOrderId);
+    this.listener?.(events, takerSide);
+    return events;
   }
 
   // --- randomness -----------------------------------------------------------

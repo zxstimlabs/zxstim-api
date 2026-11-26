@@ -8,6 +8,13 @@
       "when": 1795639748559,
       "tag": "0000_cefi_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1795707857093,
+      "tag": "0001_cefi_market",
+      "breakpoints": true
     }
   ]
 }

@@ -22,6 +22,53 @@ export const BOT = {
   intervalMs: 500, // one bot step per interval
 } as const;
 
-// Redis keys: `${prefix}:orders` (hash id -> order JSON) and `${prefix}:meta`
-// (hash: sequence, mid, idSeq).
-export const ORDERBOOK_REDIS_PREFIX = `orderbook:${ORDERBOOK_MARKET}`;
+// --- CeFi users trading on the same book (src/modules/orderbook/market.ts) ---
+//
+// Balances are simulated. ETH is held in lots; VND in "quote units", the
+// product of the engine's units (ticks × lots = VND × 10^6), so every fill's
+// cost (price × quantity) is exact with no rounding anywhere.
+export const QUOTE_UNITS_PER_VND = VND_TICKS * ETH_LOTS; // 10^6
+
+// User order ids start with this; the bot never cancels, amends or trims them.
+// Bot ids are b<n>, a<n> (resting) and t<n> (takers).
+export const USER_ORDER_PREFIX = "u";
+
+export const USERS = {
+  // Every account starts with this, created on its first order.
+  startVnd: 50_000_000,
+  startEth: 1,
+  minEth: 0.001, // order size bounds, ETH (4 dp, the lot size)
+  maxEth: 100,
+  // Limit prices are whole VND, within this fraction of the reference price
+  // (last trade, else the book's mid): 0.5 → 50%–150% of it.
+  priceBand: 0.5,
+  maxOpenOrders: 20,
+  historyLimit: 100, // closed orders kept per account
+  fillsLimit: 100, // fills kept per account
+  // Order placements + cancels per account per minute.
+  actionsPerMinute: 120,
+} as const;
+
+// Public market data. Trades and candles are saved in the CeFi DB; the newest
+// are kept in memory for the API.
+export const MARKET_DATA = {
+  tradesLimit: 100, // recent public trades in memory (the snapshot shows 50)
+  depthLevels: 10, // price levels per side in the public snapshot
+  candleLimit: 1500, // candles per resolution in memory and in the DB (1m: 25 h, enough for the 24 h ticker)
+  // The trade log (every match, bot or user) is kept this long, then pruned:
+  // users' own fills are kept for good in their history, and candles summarise
+  // the rest. Pruning runs hourly.
+  tradeRetentionDays: 30,
+  pruneIntervalMs: 60 * 60 * 1000,
+} as const;
+
+export const CANDLE_RESOLUTIONS = {
+  "1m": 60,
+  "5m": 300,
+  "15m": 900,
+  "1h": 3_600,
+  "4h": 14_400,
+  "1d": 86_400,
+} as const;
+export type Resolution = keyof typeof CANDLE_RESOLUTIONS;
+export const RESOLUTIONS = Object.keys(CANDLE_RESOLUTIONS) as Resolution[];

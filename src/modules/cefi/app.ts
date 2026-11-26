@@ -8,6 +8,7 @@
 //   GET  /health     200 while SQLite and Redis answer
 //   POST /accounts   { pin } → 201 { accountNumber } + session cookie
 //   *    /auth/*     Better Auth, allowlisted endpoints only (AUTH_PATHS)
+//   /market/*, /me/* ETH/VND market data and the user's orders (market.ts)
 
 import { Elysia, t } from "elysia";
 import { cors } from "@elysiajs/cors";
@@ -19,7 +20,9 @@ import {
   placeholderEmail,
 } from "./account";
 import type { CefiAuth } from "./auth";
+import { marketRoutes } from "./market";
 import type { CefiStorage } from "./storage";
+import type { OrderbookRunner } from "../orderbook";
 
 // The Better Auth endpoints the web app uses. Everything else, including all
 // email/password-reset/social routes and the raw /sign-up/email, is 404 here;
@@ -46,11 +49,14 @@ export interface CefiAppDeps {
   storage: CefiStorage;
   origins: string[];
   healthy: () => Promise<boolean>;
+  // The ETH/VND market; null while it loads. Absent: the market routes 503.
+  market?: () => OrderbookRunner | null;
 }
 
-export function createCefiApp({ auth, storage, origins, healthy }: CefiAppDeps) {
+export function createCefiApp({ auth, storage, origins, healthy, market = () => null }: CefiAppDeps) {
   return new Elysia({ name: "cefi" })
-    .use(cors({ origin: origins, credentials: true, maxAge: 600 }))
+    // ETag is exposed so the web app can poll with If-None-Match.
+    .use(cors({ origin: origins, credentials: true, maxAge: 600, exposeHeaders: ["etag", "retry-after"] }))
     .get("/health", async ({ set }) => {
       if (await healthy().catch(() => false)) return "ok";
       set.status = 503;
@@ -111,5 +117,6 @@ export function createCefiApp({ auth, storage, origins, healthy }: CefiAppDeps) 
       },
       // Better Auth reads the body itself.
       { parse: "none" },
-    );
+    )
+    .use(marketRoutes({ auth, storage, origins, market }));
 }

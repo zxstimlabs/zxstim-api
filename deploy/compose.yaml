@@ -14,18 +14,20 @@
 #
 # Volumes: <project>_defi-data at /data/defi (DeFi indexer DB, disposable:
 # rebuilt from chain), <project>_cefi-data at /data/cefi (CeFi accounts DB:
-# real accounts, back it up) and <project>_redis-data (order book, session
-# cache). `up`, `restart` and deploys keep all three; `down -v` deletes them
+# real accounts, balances and the ETH/VND order book: back it up) and
+# <project>_redis-data (CeFi session cache, rate limits, PIN lockouts).
+# `up`, `restart` and deploys keep all three; `down -v` deletes them
 # (develop teardown does that on purpose). Never `down -v` production.
 # (<project>_data is the DeFi DB's pre-rename volume, /data/sqlite.db; unused.)
 
 name: zxstim-api
 
 services:
-  # Order-book store (src/modules/orderbook). Unlike eth-rpc's counters-only
-  # Redis, this one persists: append-only file, fsync every second, on its own
-  # volume, so the book survives restarts of either container. noeviction:
-  # never silently drop book state. No `ports:` — only this stack reaches it.
+  # CeFi sessions cache, rate limits and PIN lockouts (src/modules/cefi). The
+  # order book is in the CeFi DB, not here. Persists anyway (append-only file,
+  # fsync every second, own volume) so sessions and lockouts survive restarts.
+  # noeviction: never silently drop a lockout. No `ports:` — only this stack
+  # reaches it.
   redis:
     image: redis:8-alpine
     command:
