@@ -26,34 +26,67 @@ function expectMirrors(db: SqliteMarketDb, runner: OrderbookRunner): void {
 }
 
 describe("OrderbookBot", () => {
-  test("seed builds maxLevels levels per side, one tick either side of the mid", () => {
+  test("seed fills BOT.levels levels per side, straddling the price", () => {
     const bot = new OrderbookBot(new MatchingEngine(), mulberry32(1));
     bot.seed();
     const { bids, asks } = bot.engine.snapshot();
-    expect(toLevels(bids)).toHaveLength(BOT.maxLevels);
-    expect(toLevels(asks)).toHaveLength(BOT.maxLevels);
-    expect(bids[0]!.price).toBe(toTicks(BOT.midStart - BOT.tickVnd));
-    expect(asks[0]!.price).toBe(toTicks(BOT.midStart + BOT.tickVnd));
+    expect(toLevels(bids)).toHaveLength(BOT.levels);
+    expect(toLevels(asks)).toHaveLength(BOT.levels);
+    expect(bids[0]!.price).toBe(toTicks(bot.bidLevel(0)));
+    expect(asks[0]!.price).toBe(toTicks(bot.askLevel(0)));
+    expect(bot.bidLevel(0)).toBeLessThan(BOT.midStart);
+    expect(bot.askLevel(0)).toBeGreaterThan(BOT.midStart);
     assertBookInvariants(bot.engine);
   });
 
-  test("2,000 steps keep the book valid, within depth, on the tick grid, mid in band", () => {
+  test("3,000 steps: quotes stay around the price, the book changes every step, trades stay near the price", () => {
     const bot = new OrderbookBot(new MatchingEngine(), mulberry32(42));
     bot.seed();
+    let calls = 0;
+    const trades: { price: bigint; mid: number }[] = [];
+    bot.listener = (events) => {
+      calls++;
+      for (const e of events) if (e.type === "trade") trades.push({ price: e.trade.price, mid: bot.state.mid });
+    };
     const grid = toTicks(BOT.tickVnd);
-    for (let i = 0; i < 2000; i++) {
-      const before = bot.engine.sequence;
+    const steps = 3000;
+    for (let i = 0; i < steps; i++) {
+      const before = calls;
       bot.step();
+      expect(calls).toBeGreaterThan(before); // something on the book changed
       assertBookInvariants(bot.engine);
       const { bids, asks } = bot.engine.snapshot();
-      expect(toLevels(bids).length).toBeLessThanOrEqual(BOT.maxLevels);
-      expect(toLevels(asks).length).toBeLessThanOrEqual(BOT.maxLevels);
+      expect(toLevels(bids).length).toBeLessThanOrEqual(BOT.levels);
+      expect(toLevels(asks).length).toBeLessThanOrEqual(BOT.levels);
       for (const o of [...bids, ...asks]) expect(o.price % grid).toBe(0n);
-      expect(bot.state.mid).toBeGreaterThanOrEqual(BOT.midMin);
-      expect(bot.state.mid).toBeLessThanOrEqual(BOT.midMax);
-      expect(bot.engine.sequence).toBeGreaterThanOrEqual(before);
+      for (const o of bids) expect(o.price <= toTicks(bot.bidLevel(0)) && o.price >= toTicks(bot.bidLevel(BOT.levels - 1))).toBe(true);
+      for (const o of asks) expect(o.price >= toTicks(bot.askLevel(0)) && o.price <= toTicks(bot.askLevel(BOT.levels - 1))).toBe(true);
+      expect(bids.length).toBeLessThanOrEqual(BOT.ordersPerSide * 2);
+      expect(asks.length).toBeLessThanOrEqual(BOT.ordersPerSide * 2);
     }
-    expect(bot.engine.sequence).toBeGreaterThan(1000); // it actually trades and rests orders
+    // About one bot trade per BOT.takerEveryMs, each within a few ticks of the price.
+    const takers = new Set(trades.map((t) => t.mid)).size;
+    expect(takers).toBeGreaterThan(0);
+    const expected = (steps * BOT.intervalMs) / BOT.takerEveryMs;
+    expect(trades.length).toBeGreaterThan(expected * 0.7);
+    expect(trades.length).toBeLessThan(expected * 2.5);
+    for (const t of trades) {
+      const off = Math.abs(Number(t.price) / 100 - t.mid);
+      expect(off).toBeLessThan((BOT.takerLimitTicks + 0.5) * BOT.tickVnd);
+    }
+    // No band to hit: the price just wanders (≈0.7% σ over 3,000 one-second steps).
+    expect(Math.abs(bot.state.mid / BOT.midStart - 1)).toBeLessThan(0.05);
+  });
+
+  test("the price has no hard band: it can wander past the old 45M–55M box", () => {
+    // Start right at the old ceiling; a band would hold it below 55M.
+    const bot = new OrderbookBot(new MatchingEngine(), mulberry32(5), { mid: 55_000_000, idSeq: 0 });
+    let above = 0;
+    for (let i = 0; i < 2000; i++) {
+      (bot as unknown as { movePrice(): void }).movePrice();
+      if (bot.state.mid > 55_000_000) above++;
+    }
+    expect(above).toBeGreaterThan(0);
   });
 
   test("every step leaves the DB holding exactly the live book", () => {
@@ -90,7 +123,7 @@ describe("loadRunner", () => {
     const crossed = newDb();
     loadRunner(crossed.db, mulberry32(6))!.tick();
     crossed.sqlite.run(
-      `UPDATE cefi_book_order SET price = ${toTicks(BOT.midMax * 2)} WHERE side = 'buy' AND rowid = (SELECT min(rowid) FROM cefi_book_order WHERE side = 'buy')`,
+      `UPDATE cefi_book_order SET price = ${toTicks(BOT.midStart * 2)} WHERE side = 'buy' AND rowid = (SELECT min(rowid) FROM cefi_book_order WHERE side = 'buy')`,
     );
     expect(loadRunner(crossed.db)).toBeNull();
 

@@ -280,7 +280,9 @@ describe("persistence: book, money and trades in one DB", () => {
       if (i % 20 === 0) {
         const user = ["p1", "p2"][(i / 20) % 2]!;
         const bid = runner.bot.engine.snapshot().bids[0]!.price;
-        runner.market.placeOrder(user, { side: "buy", type: "limit", price: bid - toTicks(BOT.tickVnd * (i % 3)), quantity: lots(0.05) });
+        // A few ticks under the best bid, so some stay open (the bot sells into
+        // bids that end up above the price).
+        runner.market.placeOrder(user, { side: "buy", type: "limit", price: bid - toTicks(BOT.tickVnd * (4 + (i % 3))), quantity: lots(0.05) });
         runner.market.placeOrder(user, { side: "sell", type: "market", quantity: lots(0.02) });
       }
     }

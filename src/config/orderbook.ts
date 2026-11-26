@@ -1,6 +1,5 @@
 // ETH/VND order book: market units and the background bot's parameters.
-// Server-side only. Values from cex-orderbook-matching-engine's
-// scripts/test.script.ts.
+// Server-side only.
 //
 // The engine works in integer base units (bigint):
 //   ETH 4 dp -> 1 lot  = 0.0001 ETH -> lots  = ETH * 10_000
@@ -11,15 +10,34 @@ export const ORDERBOOK_MARKET = "ETH-VND";
 export const ETH_LOTS = 10_000; // lots per 1 ETH (4 dp)
 export const VND_TICKS = 100; // ticks per 1 VND (2 dp)
 
+// The background market maker (src/modules/orderbook/bot.ts). Two speeds:
+// the book changes every step (adds, cancels, resizes: they only update the
+// current-book rows, so they cost no storage), while trades, which are what
+// the trade log and candles grow with, happen about once per takerEveryMs.
 export const BOT = {
-  midStart: 50_000_000, // starting mid, VND per ETH
-  midMin: 45_000_000, // the mid random-walks inside this band
-  midMax: 55_000_000,
-  tickVnd: 50_000, // VND between adjacent price levels
-  maxLevels: 10, // price levels kept per side
-  ethMin: 0.1, // order size range, ETH (on a 0.01 ETH grid)
-  ethMax: 2.0,
-  intervalMs: 5_000, // one bot step per interval (fewer trades and rows to store)
+  intervalMs: 1_000, // one step: the price moves and the bot updates its quotes
+  takerEveryMs: 5_000, // average time between the bot's trades
+
+  // The book: `levels` price levels per side on a `tickVnd` grid, the inside
+  // ones straddling the price, about `ordersPerSide` resting orders a side.
+  tickVnd: 10_000, // VND between price levels (0.02% at 50M)
+  levels: 15,
+  ordersPerSide: 30,
+  quoteActionsMax: 3, // random adds/cancels/resizes per step (1 to this)
+  makerEthMin: 0.005, // resting order sizes, ETH, log-uniform (most are small)
+  makerEthMax: 0.5,
+  takerEthMin: 0.002, // trade sizes, ETH, log-uniform
+  takerEthMax: 0.08,
+  takerLimitTicks: 3, // a bot trade never goes more than this past the price
+
+  // The price: a random walk in percentage terms with no band, calm and busy
+  // spells, slow trends, and a weak pull back toward midStart over days.
+  midStart: 50_000_000, // VND per ETH on a fresh book; the long-run anchor
+  dailyVolatility: 0.025, // typical daily move in a normal spell (2.5%)
+  spellMinutes: 30, // average length of a calm or busy spell
+  trendHours: 2, // average length of a trend
+  trendPerHour: 0.003, // typical trend strength (0.3% per hour)
+  anchorHalfLifeDays: 7, // a gap from midStart halves in about this long
 } as const;
 
 // --- CeFi users trading on the same book (src/modules/orderbook/market.ts) ---
