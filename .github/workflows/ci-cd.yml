@@ -175,6 +175,7 @@ jobs:
       DEPLOY_HOST: zxstim-rpc.tail2e11cd.ts.net
       STACK: ${{ github.ref_name == 'main' && 'zxstim-api' || 'zxstim-api-dev' }}
       HOST_PORT: ${{ github.ref_name == 'main' && '8003' || '8004' }}
+      CEFI_HOST_PORT: ${{ github.ref_name == 'main' && '8005' || '8006' }}
       IMAGE: ${{ needs.build.outputs.image }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -215,16 +216,20 @@ jobs:
           ssh server "cat > /opt/$STACK/deploy.sh && chmod 700 /opt/$STACK/deploy.sh" < deploy/deploy.sh
           ssh server "cat > /opt/$STACK/smoke-test.sh && chmod 700 /opt/$STACK/smoke-test.sh" < deploy/smoke-test.sh
 
+      # CEFI_HOST_PORT is not a secret: compose reads it from this .env to
+      # publish the CeFi API (api.cefi.vn) port for this stack.
       - name: Write .env from environment secrets
         env:
           ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
           HOT_MANAGER_WALLET_PRIVATE_KEY: ${{ secrets.HOT_MANAGER_WALLET_PRIVATE_KEY }}
+          BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
+          CEFI_PIN_PEPPER: ${{ secrets.CEFI_PIN_PEPPER }}
         run: |
-          vars="ARBITRUM_SEPOLIA_RPC_URL HOT_MANAGER_WALLET_PRIVATE_KEY"
+          vars="ARBITRUM_SEPOLIA_RPC_URL HOT_MANAGER_WALLET_PRIVATE_KEY BETTER_AUTH_SECRET CEFI_PIN_PEPPER"
           for v in $vars; do
             [ -n "${!v}" ] || { echo "::error::secret $v is empty in environment ${{ github.ref_name == 'main' && 'production' || 'develop' }}"; exit 1; }
           done
-          for v in $vars; do printf '%s=%s\n' "$v" "${!v}"; done \
+          { for v in $vars; do printf '%s=%s\n' "$v" "${!v}"; done; printf 'CEFI_HOST_PORT=%s\n' "$CEFI_HOST_PORT"; } \
             | ssh server "umask 077; cat > /opt/$STACK/.env.next"
 
       - name: Pull, restart, health check (rolls back on failure)
@@ -233,7 +238,7 @@ jobs:
         run: printf '%s' "$GHCR_TOKEN" | ssh server "/opt/$STACK/deploy.sh $STACK $HOST_PORT $IMAGE"
 
       - name: Verify from the server
-        run: ssh server "curl -fsS http://127.0.0.1:$HOST_PORT/health && echo"
+        run: ssh server "curl -fsS http://127.0.0.1:$HOST_PORT/health && echo && curl -fsS http://127.0.0.1:$CEFI_HOST_PORT/health && echo"
 
       # develop is a throwaway test environment: test the live stack on the
       # server, then remove it (container, DB volume, network, and the .env

@@ -11,8 +11,10 @@
 # A fresh develop DB starts a full indexer backfill (tens of minutes), so pool
 # state may still be 503 here. The test checks that the schema exists, the
 # routes answer, the RPC secret reaches the right chain, the ETH/VND order-book
-# bot runs and saves to Redis, and both the DB and the book survive a recreate
-# (and the book a Redis restart) — not that the backfill has finished.
+# bot runs and saves to Redis, the CeFi API creates accounts and signs in with
+# a PIN (with lockout and strict CORS), and the DB, the book and a CeFi session
+# survive a recreate (the book also a Redis restart) — not that the backfill
+# has finished.
 #
 # Output goes to the public workflow log, so it prints only status codes,
 # chain ids and pass/fail lines — never URLs, response bodies, or container
@@ -81,6 +83,50 @@ s1=$(seq_now); sleep 3; s2=$(seq_now)
 [ "${s2:-0}" -gt "${s1:-0}" ] 2>/dev/null && pass "bot is active (sequence $s1 → $s2)" || fail "sequence did not advance ($s1 → $s2)"
 check "$(redis config get appendonly | sed -n 2p)" yes "Redis append-only persistence on"
 
+echo "== CeFi API (api.cefi.vn): accounts, PIN sign-in, lockout, CORS"
+cport=$(sed -n 's/^CEFI_HOST_PORT=//p' "$dir/.env")
+cb=http://127.0.0.1:${cport:-0}
+corigin=https://cefi.vn
+hdr=$(mktemp)
+# POST JSON to the CeFi API: cpost <path> <json> <client-ip> [origin] → status code.
+# Response headers land in $hdr, the body in $hdr.body.
+cpost() {
+  curl -s -m 15 -o "$hdr.body" -D "$hdr" -w '%{http_code}' -H "Origin: ${4:-$corigin}" \
+    -H 'Content-Type: application/json' -H "X-Real-IP: $3" -d "$2" "$cb$1"
+}
+# The cookies are Secure and this is plain http to localhost, so carry them by
+# hand rather than in a curl jar (which would drop them).
+cookies() { tr -d '\r' < "$hdr" | awk 'tolower($1)=="set-cookie:"{sub(/^[^:]*: /,""); split($0,a,";"); print a[1]}' | paste -sd ';' - | sed 's/;/; /g'; }
+session_user() { curl -s -m 10 -H "Origin: $corigin" -H "Cookie: $1" "$cb/auth/get-session" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p'; }
+
+check "$(code "$cb/health")" 200 "GET /health on the CeFi port"
+check "$(code -X POST "$base/accounts")" 404 "the main API has no CeFi routes"
+check "$(cpost /accounts '{"pin":"135790"}' 192.0.2.10)" 201 "POST /accounts"
+acct=$(sed -n 's/.*"accountNumber":"\([^"]*\)".*/\1/p' "$hdr.body")
+canon=$(printf '%s' "$acct" | tr -d -)
+[[ "$acct" =~ ^[0-9A-Z]{4}(-[0-9A-Z]{4}){3}$ ]] && pass "account number has the XXXX-XXXX-XXXX-XXXX format" || fail "unexpected account number format"
+cookie=$(cookies)
+[ -n "$cookie" ] && pass "session cookie set" || fail "no session cookie"
+[ -n "$canon" ] && [ "$(session_user "$cookie")" = "$canon" ] && pass "GET /auth/get-session returns the new account" || fail "get-session did not return the new account"
+check "$(cpost /auth/sign-in/username "{\"username\":\"$acct\",\"password\":\"135790\"}" 192.0.2.11)" 200 "sign in with account number + PIN"
+check "$(cpost /auth/sign-in/username "{\"username\":\"$acct\",\"password\":\"000000\"}" 192.0.2.12)" 401 "wrong PIN"
+for _ in 2 3 4 5; do cpost /auth/sign-in/username "{\"username\":\"$acct\",\"password\":\"000000\"}" 192.0.2.12 >/dev/null; done
+check "$(cpost /auth/sign-in/username "{\"username\":\"$acct\",\"password\":\"135790\"}" 192.0.2.13)" 429 "right PIN after 5 wrong ones: locked (per account)"
+check "$(cpost /auth/sign-up/email '{}' 192.0.2.14)" 404 "raw /auth/sign-up/email is not exposed"
+check "$(cpost /accounts '{"pin":"135790"}' 192.0.2.15 https://evil.example)" 403 "POST /accounts from another origin"
+pre() {
+  curl -s -m 5 -o /dev/null -D - -X OPTIONS -H "Origin: $1" -H 'Access-Control-Request-Method: POST' \
+    -H 'Access-Control-Request-Headers: content-type' "$cb/auth/sign-in/username" \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}'
+}
+check "$(pre "$corigin")" "$corigin" "CORS preflight allows $corigin"
+check "$(pre https://evil.example)" "" "CORS preflight allows no other origin"
+[ "$(redis --scan --pattern 'cefi:*' | grep -c .)" -gt 0 ] && pass "auth state is in this stack's Redis (cefi:*)" || fail "no cefi:* keys in Redis"
+# A second account (the first one is now locked) for the CeFi DB persistence
+# check after the recreate: signing in needs the user + PIN rows from cefi.db.
+check "$(cpost /accounts '{"pin":"246802"}' 192.0.2.16)" 201 "POST /accounts (second account)"
+acct2=$(sed -n 's/.*"accountNumber":"\([^"]*\)".*/\1/p' "$hdr.body")
+
 echo "== DB survives a container recreate (named volume)"
 # Wait for the indexer to start backfilling (it saves its cursor per chunk),
 # then replace the container. A persisted DB resumes from the saved cursor.
@@ -109,7 +155,11 @@ else
   compose logs --no-color --no-log-prefix app 2>/dev/null | grep -F '[orderbook ETH-VND]' | cut -c1-200 | sed 's/^/    log: /'
   s3=$(seq_now); sleep 2
   [ "$(seq_now)" -gt "${s3:-0}" ] 2>/dev/null && pass "bot active again after recreate" || fail "bot not active after recreate"
+  for _ in $(seq 1 15); do [ "$(code "$cb/health")" = 200 ] && break; sleep 1; done
+  [ -n "$canon" ] && [ "$(session_user "$cookie")" = "$canon" ] && pass "CeFi session survives the app recreate" || fail "CeFi session lost on app recreate"
+  check "$(cpost /auth/sign-in/username "{\"username\":\"$acct2\",\"password\":\"246802\"}" 192.0.2.17)" 200 "CeFi accounts DB survives the app recreate (PIN sign-in)"
 fi
+rm -f "$hdr" "$hdr.body"
 
 echo "== order book survives a Redis restart (append-only file)"
 before=$(seq_now)

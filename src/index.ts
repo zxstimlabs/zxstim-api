@@ -7,6 +7,7 @@ import { sponsor } from "./modules/sponsor";
 import { claim } from "./modules/claim";
 import { sqlite } from "./lib/db";
 import { startOrderbookBot } from "./modules/orderbook";
+import { startCefi } from "./modules/cefi";
 
 // Local dev: 127.0.0.1:8001. The container image sets HOST=0.0.0.0 and
 // PORT=8000, and compose publishes that on the host's 127.0.0.1 only.
@@ -47,3 +48,7 @@ console.log(
 void startOrderbookBot().catch((err) => {
   console.error("[orderbook] failed to start:", err);
 });
+
+// CeFi API (api.cefi.vn): a second listener with its own CORS and auth. Off
+// unless CEFI_ENABLED=1; when on, it throws here on bad config (fail fast).
+startCefi(HOST);
