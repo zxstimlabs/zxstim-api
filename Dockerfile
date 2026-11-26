@@ -20,25 +20,23 @@ RUN bun install --frozen-lockfile
 FROM deps AS build
 COPY tsconfig.json ./
 COPY src ./src
-RUN bun run build && mkdir -p /out/data /out/cefi
+RUN bun run build && mkdir -p /out/data/defi /out/data/cefi
 
 FROM gcr.io/distroless/base-debian12:nonroot AS runtime
 WORKDIR /app
 COPY --from=build /app/build/zxstim-api /app/zxstim-api
-# Applied on startup, relative to WORKDIR: drizzle/ by src/lib/db.ts (DeFi),
-# drizzle-cefi/ by src/modules/cefi/db.ts (CeFi).
+# Applied on startup, relative to WORKDIR: drizzle/defi/ by src/lib/db.ts,
+# drizzle/cefi/ by src/modules/cefi/db.ts.
 COPY drizzle ./drizzle
-COPY drizzle-cefi ./drizzle-cefi
-# The SQLite volumes mount here: /data (DeFi indexer DB, disposable) and
-# /cefi (CeFi accounts DB, keep). A new named volume takes the directory's
-# owner, so nonroot can write the DBs and their WAL files.
+# One folder per DB, each its own volume mount: /data/defi (DeFi indexer DB,
+# disposable) and /data/cefi (CeFi accounts DB, keep). A new named volume
+# takes the directory's owner, so nonroot can write the DBs and their WAL files.
 COPY --from=build --chown=65532:65532 /out/data /data
-COPY --from=build --chown=65532:65532 /out/cefi /cefi
 ENV HOST=0.0.0.0 \
     PORT=8000 \
     CEFI_PORT=8001 \
-    DATABASE_PATH=/data/sqlite.db \
-    CEFI_DATABASE_PATH=/cefi/cefi.db
+    DEFI_DATABASE_PATH=/data/defi/defi.db \
+    CEFI_DATABASE_PATH=/data/cefi/cefi.db
 USER nonroot
 # 8000: main API (api.zxstim.com). 8001: CeFi API (api.cefi.vn), only when CEFI_ENABLED=1.
 EXPOSE 8000 8001

@@ -5,8 +5,8 @@ import { defineConfig } from "drizzle-kit";
 export default defineConfig({
   dialect: "sqlite",
   schema: "./src/modules/cefi/schema.ts",
-  out: "./drizzle-cefi",
+  out: "./drizzle/cefi",
   dbCredentials: {
-    url: process.env.CEFI_DATABASE_PATH ?? "./cefi.db",
+    url: process.env.CEFI_DATABASE_PATH ?? "./data/cefi/cefi.db",
   },
 });

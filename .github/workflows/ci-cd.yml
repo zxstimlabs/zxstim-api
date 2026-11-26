@@ -114,7 +114,7 @@ jobs:
           IMAGE: ${{ steps.ref.outputs.image }}
         run: |
           set -euo pipefail
-          docker run -d --name boot --read-only --tmpfs /tmp -v boot-data:/data \
+          docker run -d --name boot --read-only --tmpfs /tmp -v boot-defi:/data/defi \
             -p 127.0.0.1:8000:8000 \
             -e ARBITRUM_SEPOLIA_RPC_URL=http://127.0.0.1:9 \
             -e BACKFILL_RPC_URL=http://127.0.0.1:9 \
